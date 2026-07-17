@@ -91,7 +91,11 @@ Prose-only transforms, in order:
 1. Normalize line endings (CRLF/CR → LF).
 2. Strip boilerplate phrases (curated, anchored regexes: "please …",
    "thank you …", "as an AI …", "write clean code / follow best practices"
-   filler lines). Conservative: whole-phrase matches only.
+   filler lines). Conservative: whole-phrase matches only, with word
+   boundaries and terminal-punctuation anchors so meaning-bearing uses
+   survive — "write a thank you email", "as an aid", and requirements
+   following a filler phrase ("follow best practices and use bcrypt") are
+   kept. Patterns never consume the rest of a line beyond the phrase itself.
 3. Dedupe identical non-blank prose lines (stripped-key match) — only lines
    ≥ 12 chars, to spare short legitimate repeats ("- yes", "OK").
 4. Collapse 3+ blank lines to one; trim trailing whitespace.
@@ -136,6 +140,13 @@ LLM pass (mode `hybrid` or `local`):
   (> 20 chars). Otherwise keep the rules output; never fail the request.
 - Timeout: `encoder.llm_timeout_s` (default **15 s**, was 120) → on timeout or
   any LLM error, fall back to rules output and note it in logs.
+- Truncation guard: the request sizes `max_tokens` to the job
+  (≈ `target_ratio × input_tokens × 1.5`, clamped to `[256, local.max_tokens]`)
+  and any response with `finish_reason == "length"` is treated as an error —
+  a truncated rewrite (which always "saves tokens") is never accepted.
+  (v1 silently forwarded rewrites cut off mid-sentence at max_tokens=2048.)
+- Log hygiene: LLM error notes truncate any response body to 200 chars;
+  prompt content is never logged in full.
 
 ### cache
 
@@ -158,8 +169,15 @@ identical input always yields identical compressed output.
 - Catch-all `/v1/*`: forward method, path, **query params**, and raw body
   bytes untouched (v1 dropped non-JSON bodies and POST query params); stream
   response verbatim.
-- `GET /health`: config summary, cache stats, local-LLM reachability probe
-  with a 3 s timeout; never blocks other traffic.
+- `GET /health`: config summary (including which config file was loaded),
+  cache stats, local-LLM reachability probe with a 3 s timeout (`ok` requires
+  status < 400; includes `model_present` — whether the configured model
+  appears in the local `/models` listing — informational, may be null);
+  never blocks other traffic.
+- DNS-rebinding guard: when bound to loopback, requests whose `Host` header
+  is not `localhost`/`127.0.0.1`/`[::1]` (any port) are rejected with 403 —
+  a malicious web page can otherwise script requests to the local proxy and
+  spend the user's upstream key.
 - Auth: if the client sends `Authorization` and `pass_client_auth: true`
   (default), pass it through; else sign with the env var named by
   `upstream_api_key_env`. New `proxy.require_client_auth` (default `false`,
@@ -261,3 +279,6 @@ Default local model: `gemma3:4b` (v1 shipped the nonexistent `gemma4:12b-mlx`).
 | Hybrid guard compares vs pre-rules tokens | Compares vs post-rules tokens |
 | Unauthenticated LAN callers spend the user's key | Documented; optional `require_client_auth`; default bind 127.0.0.1 |
 | Catch-all drops non-JSON bodies and POST query params | Raw byte + query passthrough |
+| Truncated LLM output (finish_reason=length) silently accepted | Sized max_tokens + finish_reason guard |
+| Boilerplate regexes eat meaning-bearing prose | Boundary/punctuation-anchored, phrase-only patterns |
+| DNS rebinding: web pages can drive the local proxy | Host-header guard (403 on non-loopback Host) |

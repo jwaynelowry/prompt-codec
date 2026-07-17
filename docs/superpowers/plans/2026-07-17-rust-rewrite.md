@@ -42,10 +42,13 @@ Expected: `2 passed` (PYTHONPATH resolves because pytest runs from `legacy/`).
 
 ```bash
 cargo init --name prompt-codec
+# Pin edition 2021 in Cargo.toml (avoids edition-2024 unsafe std::env::set_var in tests)
 cargo add tokio --features full
 cargo add axum reqwest --features reqwest/json,reqwest/stream
 cargo add serde --features derive
-cargo add serde_json serde_yaml clap --features clap/derive
+# preserve_order: tool-JSON minify must not reorder keys (byte-stable output across turns)
+cargo add serde_json --features preserve_order
+cargo add serde_yaml clap --features clap/derive
 cargo add tracing tracing-subscriber --features tracing-subscriber/env-filter
 cargo add moka --features sync
 cargo add sha2 hex tiktoken-rs dirs futures-util anyhow regex
@@ -347,6 +350,16 @@ mod prose_tests {
         assert!(t.contains("do not delete the prod database"));
     }
     #[test]
+    fn keeps_meaning_bearing_phrase_lookalikes() {
+        // v1 regressions the v2 patterns must not repeat:
+        let t = strip_boilerplate("write a thank you email to the team\n");
+        assert!(t.contains("thank you email"));
+        let t = strip_boilerplate("this serves as an aid to debugging\n");
+        assert!(t.contains("as an aid to debugging"));
+        let t = strip_boilerplate("Follow best practices and use bcrypt for hashing\n");
+        assert!(t.contains("use bcrypt for hashing")); // phrase-only removal, rest of line survives
+    }
+    #[test]
     fn drops_pure_fluff_lines() {
         let t = strip_boilerplate("- Please be careful\n- this is important\nreal content\n");
         assert_eq!(t.trim(), "real content");
@@ -383,12 +396,15 @@ fn boilerplate_res() -> &'static Vec<Regex> {
         [
             r"(?im)^[ \t]*please[, ]+(i would like you to |help me with |remember to )?",
             r"(?im)^[ \t]*please\s+",
-            r"(?i)\bthank you( so much)?( in advance)?[.!]?[ \t]*",
-            r"(?i)\bas an ai[^.!\n]*[.!]?[ \t]*",
+            // terminal punctuation or end-of-line required: "thank you email" survives
+            r"(?im)\b(thank you|thanks)( so much)?( in advance)?(!|\.|$)[ \t]*",
+            // \b after "ai": "as an aid" survives
+            r"(?i)\bas an ai\b[^.!\n]*[.!]?[ \t]*",
             r"(?i)\bi hope this helps[^.!\n]*[.!]?[ \t]*",
             r"(?im)^[ \t]*i would like you to\s+",
-            r"(?i)\b(write clean code|follow best practices|make it production ready)\b[^\n]*",
-            r"(?i)\badd comments where needed\b[^\n]*",
+            // phrase-only: never consume the rest of the line
+            r"(?i)\b(write clean code|follow best practices|make it production ready)\b[.!,]?[ \t]*",
+            r"(?i)\badd comments where needed\b[.!,]?[ \t]*",
             // pure-fluff lines only — meaningful "Important: <content>" lines survive
             r"(?im)^[ \t]*[-*•]?[ \t]*(please be careful|be careful|this is important|note: this is important)[.!]?[ \t]*$",
             r"(?im)^[ \t]*[-*•][ \t]*$",
@@ -581,18 +597,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("config.yaml");
         std::fs::write(&p, "local:\n  model: qwen3:8b\n  timeout_s: 120\ndecoder:\n  enabled: true\nencoder:\n  roles: [user]\n").unwrap();
-        let (c, warnings) = load_config_from(&p).unwrap();
-        assert_eq!(c.local.model, "qwen3:8b");
-        assert_eq!(c.encoder.llm_timeout_s, 15.0); // local.timeout_s ignored
-        let joined = warnings.join("\n");
+        let loaded = load_config_from(&p).unwrap();
+        assert_eq!(loaded.config.local.model, "qwen3:8b");
+        assert_eq!(loaded.config.encoder.llm_timeout_s, 15.0); // local.timeout_s ignored
+        assert!(loaded.source.contains("config.yaml")); // source records the file path
+        let joined = loaded.warnings.join("\n");
         assert!(joined.contains("decoder"));
         assert!(joined.contains("local.timeout_s"));
         assert!(joined.contains("encoder.roles"));
     }
     #[test]
-    fn missing_file_yields_defaults() {
-        let (c, _) = resolve_config(Some("/nonexistent/x.yaml".into())).unwrap_or_else(|_| (AppConfig::default(), vec![]));
-        assert_eq!(c.proxy.port, 8787);
+    fn explicit_missing_file_is_error_and_source_tracks_defaults() {
+        assert!(resolve_config(Some("/nonexistent/x.yaml".into())).is_err());
+        // (chain fall-through to defaults is covered by running resolve_config(None)
+        //  with cwd set to an empty tempdir and $PROMPT_CODEC_CONFIG unset:
+        //  expect source == "built-in defaults")
     }
 }
 ```
@@ -631,13 +650,20 @@ Loading strategy (unknown keys must warn, not error): parse YAML to `serde_yaml:
 Public API:
 
 ```rust
-pub fn load_config_from(path: &std::path::Path) -> anyhow::Result<(AppConfig, Vec<String>)>;
+pub struct LoadedConfig {
+    pub config: AppConfig,
+    /// Human-readable provenance: the file path used, or "built-in defaults".
+    /// Carried into proxy AppState and reported by /health (Task 11).
+    pub source: String,
+    pub warnings: Vec<String>,
+}
+pub fn load_config_from(path: &std::path::Path) -> anyhow::Result<LoadedConfig>;
 /// Lookup order: explicit → $PROMPT_CODEC_CONFIG → ./config.yaml → ~/.config/prompt-codec/config.yaml → defaults.
-/// Returns the config plus warnings; logs (tracing::info) which source was used.
-pub fn resolve_config(explicit: Option<std::path::PathBuf>) -> anyhow::Result<(AppConfig, Vec<String>)>;
+/// Logs (tracing::info) which source was used.
+pub fn resolve_config(explicit: Option<std::path::PathBuf>) -> anyhow::Result<LoadedConfig>;
 ```
 
-`resolve_config` with an explicit path that doesn't exist is a hard error (the user asked for that file); missing files in the search chain just fall through, ending at `AppConfig::default()` with a "using built-in defaults" log line.
+`resolve_config` with an explicit path that doesn't exist is a hard error (the user asked for that file); missing files in the search chain just fall through, ending at `AppConfig::default()` with `source: "built-in defaults".into()`.
 
 - [ ] **Step 4: PASS. Step 5: Commit** `feat: config with lookup order and superseded-key warnings`.
 
@@ -752,13 +778,30 @@ async fn timeout_is_an_error_not_a_hang() {
 }
 
 #[tokio::test]
-async fn health_probe_reports_ok_and_down() {
+async fn truncated_output_is_rejected() {
+    // finish_reason=length must be an error — a truncated rewrite always "saves
+    // tokens" and would otherwise be forwarded with its tail silently dropped.
     let server = MockServer::start().await;
-    Mock::given(method("GET")).and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": []})))
+    Mock::given(method("POST")).and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"content": "cut off mid"}, "finish_reason": "length"}]
+        })))
         .mount(&server).await;
     let (c, t) = cfg(&server.uri(), 5.0);
-    assert!(LlmClient::new(&c, t).health().await.ok);
+    assert!(LlmClient::new(&c, t).encode_text("long prompt", 0.45).await.is_err());
+}
+
+#[tokio::test]
+async fn health_probe_reports_ok_model_presence_and_down() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "gemma3:4b"}]})))
+        .mount(&server).await;
+    let (c, t) = cfg(&server.uri(), 5.0);
+    let h = LlmClient::new(&c, t).health().await;
+    assert!(h.ok);
+    assert_eq!(h.model_present, Some(true)); // default model is gemma3:4b
     let mut down = LocalConfig::default();
     down.base_url = "http://127.0.0.1:1/v1".into();
     assert!(!LlmClient::new(&down, 5.0).health().await.ok);
@@ -772,7 +815,7 @@ Port `ENCODE_SYSTEM` verbatim from `legacy/prompt_codec/local_llm.py` (the 8-rul
 ```rust
 pub struct LlmClient { http: reqwest::Client, base_url: String, api_key: String, model: String, temperature: f64, max_tokens: u32 }
 
-pub struct LlmHealth { pub ok: bool, pub status: Option<u16>, pub error: Option<String>, pub base_url: String, pub model: String }
+pub struct LlmHealth { pub ok: bool, pub status: Option<u16>, pub error: Option<String>, pub base_url: String, pub model: String, pub model_present: Option<bool> }
 
 impl LlmClient {
     pub fn new(cfg: &LocalConfig, timeout_s: f64) -> Self {
@@ -784,12 +827,19 @@ impl LlmClient {
     pub async fn encode_text(&self, text: &str, target_ratio: f64) -> anyhow::Result<String> {
         let pct = ((target_ratio * 100.0) as i64).clamp(5, 95);
         let user = format!("Target length: about {pct}% of the original token count.\n\n--- ORIGINAL PROMPT ---\n{text}\n--- END ---");
+        // Size the output budget to the job so a legitimate compression fits,
+        // capped by config: clamp((count_tokens(text) as f64 * target_ratio * 1.5) as u32, 256, self.max_tokens)
         // POST {base}/chat/completions with {model, messages:[system,user], temperature, max_tokens, stream:false}
-        // Bearer auth. error_for_status(). Parse choices[0].message.content (bail! on absent/empty).
+        // Bearer auth. error_for_status(). Parse choices[0]:
+        //   - bail! if finish_reason == "length" ("llm output truncated") — NEVER accept truncations
+        //   - bail! on absent/empty message.content
+        // Error messages must truncate any response body excerpt to 200 chars (log hygiene).
         // Return content.trim().to_string()
     }
     pub async fn health(&self) -> LlmHealth {
-        // GET {base}/models with a 3s per-call override timeout; ok = status < 500
+        // GET {base}/models with a 3s per-call override timeout; ok = status < 400.
+        // model_present: Some(listing contains self.model) when the body parses as
+        // an OpenAI models list, else None (informational — MLX servers vary).
     }
 }
 ```
@@ -827,26 +877,28 @@ fn long_user(text: &str) -> serde_json::Value {
 #[tokio::test]
 async fn only_last_user_message_hits_llm_and_cache_persists() {
     let server = MockServer::start().await;
+    // NOTE: rewrite must be >20 chars (acceptance guard) yet fewer tokens than
+    // the post-rules inputs below — "tiny compressed version" is 23 chars / ~4 tokens.
     Mock::given(method("POST")).and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"message": {"content": "tiny"}}]})))
+            "choices": [{"message": {"content": "tiny compressed version"}, "finish_reason": "stop"}]})))
         .expect(2) // turn 1: msg A; turn 2: msg B. A must come from cache on turn 2.
         .mount(&server).await;
     let codec = Codec::new(test_cfg(&server.uri()));
 
-    let turn1 = vec![long_user("first long message needing compression right here")];
+    let turn1 = vec![long_user("first long message needing compression right here with plenty of words to shrink")];
     let r1 = codec.encode_messages(turn1).await;
     let a_compressed = r1.messages[0]["content"].as_str().unwrap().to_string();
-    assert_eq!(a_compressed, "tiny");
+    assert_eq!(a_compressed, "tiny compressed version");
 
     let turn2 = vec![
-        long_user("first long message needing compression right here"),
+        long_user("first long message needing compression right here with plenty of words to shrink"),
         json!({"role": "assistant", "content": "reply"}),
-        long_user("second long message also needing compression here"),
+        long_user("second long message also needing compression here with plenty of words to shrink"),
     ];
     let r2 = codec.encode_messages(turn2).await;
     assert_eq!(r2.messages[0]["content"].as_str().unwrap(), a_compressed); // byte-stable history
-    assert_eq!(r2.messages[2]["content"].as_str().unwrap(), "tiny");
+    assert_eq!(r2.messages[2]["content"].as_str().unwrap(), "tiny compressed version");
 }
 
 #[tokio::test]
@@ -942,7 +994,7 @@ Test harness pattern (top of `tests/proxy_test.rs`): start wiremock as the fake 
 
 ```rust
 async fn spawn_proxy(cfg: prompt_codec::config::AppConfig) -> String {
-    let app = prompt_codec::proxy::create_app(cfg);
+    let app = prompt_codec::proxy::create_app(cfg, "test-config".into());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -964,16 +1016,26 @@ async fn compresses_messages_and_forwards_status_and_headers() {
 }
 
 #[tokio::test]
-async fn upstream_401_reaches_client_as_401() {
-    // upstream mock: 401 with OpenAI-style error JSON
-    // assert client sees 401 and the exact body
+async fn upstream_401_and_429_reach_client_unchanged() {
+    // upstream mock: 401 with OpenAI-style error JSON, and a second route returning
+    // 429 with a retry-after header
+    // assert client sees 401/429, the exact bodies, and the retry-after header intact
 }
 
 #[tokio::test]
 async fn client_auth_passthrough_and_env_key_fallback() {
     // case 1: client sends Authorization: Bearer client-key; upstream mock asserts it receives that header
     // case 2: no client auth; set cfg.proxy.upstream_api_key_env to a var set for the test
-    //         (use a unique var name + std::env::set_var); upstream asserts Bearer env-key
+    //         (use a UNIQUE var name per test — env is process-global and tests run in
+    //          parallel; std::env::set_var is safe in edition 2021); upstream asserts Bearer env-key
+}
+
+#[tokio::test]
+async fn non_loopback_host_header_is_rejected() {
+    // DNS-rebinding guard: send a request with header Host: evil.example.com
+    // (reqwest: .header("host", "evil.example.com")) → expect 403 and that the
+    // upstream mock received NOTHING (expect(0)).
+    // A request with Host: localhost:8787 or 127.0.0.1:9999 must pass.
 }
 
 #[tokio::test]
@@ -994,14 +1056,18 @@ Write these fully (the comments above specify the assertions; the implementing a
 ```rust
 pub struct AppState {
     pub cfg: AppConfig,
+    pub config_source: String, // from LoadedConfig.source; reported by /health
     pub codec: Codec,
     pub upstream: reqwest::Client, // connect_timeout 10s, NO total timeout (streams)
 }
 
-pub fn create_app(cfg: AppConfig) -> axum::Router {
+pub fn create_app(cfg: AppConfig, config_source: String) -> axum::Router {
     // routes: POST /v1/chat/completions, POST /v1/completions,
     //         GET /health, any /v1/{*path} → catch_all
     // state: Arc<AppState>
+    // layer: axum::middleware::from_fn — DNS-rebinding guard: when cfg.proxy.host
+    //   is loopback, reject with 403 any request whose Host header (port stripped)
+    //   is not one of "localhost", "127.0.0.1", "::1", "[::1]". Applies to every route.
 }
 ```
 
@@ -1048,7 +1114,8 @@ async fn sse_stream_chunks_pass_through_byte_identical() {
 #[tokio::test]
 async fn health_reports_without_blocking() {
     // health with unreachable local LLM must return within ~4s, ok:true at top level,
-    // local.ok == false, and include cache_entries + config source fields
+    // local.ok == false, local.model_present == null,
+    // config_source == "test-config", and include cache_entries
 }
 ```
 
@@ -1056,7 +1123,7 @@ async fn health_reports_without_blocking() {
 
 - `/v1/completions`: parse; if `prompt` is a non-empty string, run `codec.encode_text` (user treatment, LLM-eligible); replace; forward via `forward()`.
 - Catch-all `any(/v1/{*path})`: read raw `Bytes` (no JSON parse), forward method + path + `request.uri().query()` + auth header; stream response back. Use `reqwest::Method::from(...)`/pass the axum method through.
-- `/health`: JSON `{ ok: true, encoder_mode, upstream, config_source, cache_entries, local: LlmHealth }` — the LLM probe already carries its own 3 s timeout.
+- `/health`: JSON `{ ok: true, encoder_mode, upstream, config_source: state.config_source, cache_entries, local: LlmHealth }` — the LLM probe already carries its own 3 s timeout; `LlmHealth` includes `model_present`.
 - [ ] **Step 4: PASS + clippy clean. Step 5: Commit** `feat: completions, raw catch-all passthrough, health`.
 
 ---
@@ -1089,7 +1156,7 @@ enum Cmd {
 }
 ```
 
-`main` = `#[tokio::main]`, init `tracing_subscriber` (env filter, default `info`), `resolve_config`, print each config warning to stderr, dispatch. `encode --json` prints `{"text":…, "stats":…, "notes":…}`. `demo` ports the sample prompt from `legacy/prompt_codec/cli.py` and prints BEFORE/AFTER + savings line (plain text, no color deps). `health` prints JSON, exit code from `local.ok`. `proxy` binds `cfg.proxy.host:port` (CLI flags override) and serves; startup line prints the URL.
+`main` = `#[tokio::main]`, init `tracing_subscriber` (env filter, default `info`), `resolve_config`, print each config warning to stderr, dispatch. `encode --json` prints `{"text":…, "stats":…, "notes":…}`. `demo` ports the sample prompt from `legacy/prompt_codec/cli.py` and prints BEFORE/AFTER + savings line (plain text, no color deps). `health` prints JSON, exit code from `local.ok`. `proxy` binds `cfg.proxy.host:port` (CLI flags override) and serves; startup line prints the URL, the config source, and — if the bind host is not loopback — a prominent warning that the proxy has no auth of its own and anything reaching it spends the upstream key. Before serving, call `tokenizer::count_tokens("warmup")` once so the BPE table loads at startup, not on the first request.
 
 - [ ] **Step 4:** `cargo run -- demo` shows savings; `cargo run -- encode "Please help me, thank you!   Fix src/main.rs"` outputs compressed text. **Step 5: Commit** `feat: CLI (proxy/encode/demo/health)`.
 
@@ -1100,8 +1167,8 @@ enum Cmd {
 **Files:**
 - Create: `tests/corpus/fluffy.txt` (port the demo sample from `legacy/prompt_codec/cli.py`), `tests/corpus/code_heavy.md` (Python with 4-space indents + two identical JS fences + repeated `}` lines), `tests/corpus/tool_dump.json` (pretty-printed 100-line JSON)
 - Create: `tests/golden_test.rs`, `scripts/ab_compare.sh`
-- Create: `config.example.yaml` (v2 keys, commented)
-- Modify: `config.yaml` (root — user's live config: update model to `gemma3:4b`, drop `decoder:` block, rename `local.timeout_s` usage to `encoder.llm_timeout_s: 15`)
+- Create: `config.example.yaml` (v2 keys, commented), `LICENSE` (MIT, © 2026 Wayne Lowry — README already declares MIT)
+- Modify: `config.yaml` (root — user's live config: update model to `gemma3:4b`, drop the `decoder:` block, drop `encoder.roles` and `stats.encoding` (superseded/unknown in v2 — would warn at every startup), replace `local.timeout_s` with `encoder.llm_timeout_s: 15`)
 - Modify: `README.md` (Rust install/run instructions, v2 behavior notes, config table; keep the client-wiring sections)
 
 - [ ] **Step 1: Failing golden tests**
