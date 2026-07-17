@@ -815,6 +815,7 @@ Port `ENCODE_SYSTEM` verbatim from `legacy/prompt_codec/local_llm.py` (the 8-rul
 ```rust
 pub struct LlmClient { http: reqwest::Client, base_url: String, api_key: String, model: String, temperature: f64, max_tokens: u32 }
 
+#[derive(serde::Serialize)] // /health embeds this in its JSON (Task 11)
 pub struct LlmHealth { pub ok: bool, pub status: Option<u16>, pub error: Option<String>, pub base_url: String, pub model: String, pub model_present: Option<bool> }
 
 impl LlmClient {
@@ -916,7 +917,7 @@ async fn rejects_rewrite_not_smaller_than_rules_output() {
 
 #[tokio::test]
 async fn tool_json_is_minified_and_never_llm_rewritten() {
-    let server = MockServer::start().await; // no mocks: any LLM call → 404 → test fails via expect(0) pattern
+    let server = MockServer::start().await; // expect(0) mock: any LLM call fails the test
     Mock::given(method("POST")).respond_with(ResponseTemplate::new(500)).expect(0).mount(&server).await;
     let codec = Codec::new(test_cfg(&server.uri()));
     let msgs = vec![json!({"role": "tool", "tool_call_id": "abc",
@@ -972,7 +973,7 @@ pub struct Codec { cfg: AppConfig, llm: LlmClient, cache: RewriteCache }
    - `system` → if `content` len < `protect_system_under_chars` → untouched; else rules.
    - `user` → rules.
    - String content only; for array-of-parts content apply the same treatment to each `{"type":"text"}` part's `text` field, leaving all else. All non-`content` fields always pass through (mutate `content` in place on the `Value`).
-4. LLM pass, when `mode ∈ {local, hybrid}` and `llm_scope != None`: candidate messages = per scope (`LastUser` → just `last_user_idx`; `All` → every user/system message meeting eligibility). For each candidate with post-rules string content ≥ `min_chars_to_compress`:
+4. LLM pass, when `mode ∈ {local, hybrid}` and `llm_scope != None`: candidates = **all** eligible user/system messages (post-rules string content ≥ `min_chars_to_compress`; system also past the protect gate). Scope only determines which candidates may CALL the LLM on a cache miss (`LastUser` → only `last_user_idx`; `All` → every candidate). For each candidate:
    - `key = RewriteCache::key(post_rules_content, target_ratio, model)`.
    - **Every** candidate does a cache lookup first (this is what keeps history byte-stable); on hit, use the cached rewrite, note `cache_hit_msg_{i}`.
    - On miss, only messages **in scope** call `llm.encode_text`. Accept iff `!rewrite.trim().is_empty() && rewrite.len() > 20 && count_tokens(rewrite) < count_tokens(post_rules_content)`; then `cache.put` and note `llm_encode_msg_{i}`. On rejection note `llm_rejected_msg_{i}`; on error note `llm_failed:{e}` and keep rules output. Never propagate LLM errors.
@@ -980,7 +981,7 @@ pub struct Codec { cfg: AppConfig, llm: LlmClient, cache: RewriteCache }
 
 Also `encode_text(&self, text, mode_override) -> (String, TokenStats, Vec<String>)` for the CLI/completions path: rules → (if mode has LLM and eligible) cache/LLM with the same guard.
 
-Wait for one clarification in the test above: with `llm_scope: LastUser`, history user messages do cache **lookups** but never trigger calls — the `expect(2)` in the first test encodes exactly that.
+Note the key behavior the first test encodes: with `llm_scope: LastUser`, history user messages do cache **lookups** but never trigger calls — hence `expect(2)`.
 
 - [ ] **Step 4: PASS. Step 5: Commit** `feat: codec with last-user LLM scope, cache-stable history, post-rules guard`.
 
@@ -1065,7 +1066,7 @@ pub fn create_app(cfg: AppConfig, config_source: String) -> axum::Router {
     // routes: POST /v1/chat/completions, POST /v1/completions,
     //         GET /health, any /v1/{*path} → catch_all
     // state: Arc<AppState>
-    // layer: axum::middleware::from_fn — DNS-rebinding guard: when cfg.proxy.host
+    // layer: axum::middleware::from_fn_with_state (guard needs cfg) — DNS-rebinding guard: when cfg.proxy.host
     //   is loopback, reject with 403 any request whose Host header (port stripped)
     //   is not one of "localhost", "127.0.0.1", "::1", "[::1]". Applies to every route.
 }
