@@ -123,6 +123,17 @@ fn truncate_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
+/// Acceptance guard shared by the message-list and text-blob paths: an LLM
+/// rewrite replaces the post-rules `baseline` only when it is non-empty,
+/// non-trivial, and strictly fewer tokens than that baseline.
+fn accept_rewrite(rewrite: &str, baseline: &str) -> bool {
+    // `len() > 20` is a BYTE-length floor — intentional per plan (bytes, not
+    // chars), matching the v1 triviality threshold.
+    !rewrite.trim().is_empty()
+        && rewrite.len() > 20
+        && count_tokens(rewrite) < count_tokens(baseline)
+}
+
 impl Codec {
     pub fn new(cfg: AppConfig) -> Self {
         let llm = LlmClient::new(&cfg.local, cfg.encoder.llm_timeout_s);
@@ -220,11 +231,16 @@ impl Codec {
                     continue;
                 }
                 // Only string content is LLM-eligible; parts arrays got the
-                // rules stage only.
+                // rules stage only. The skip note is gated behind min_chars so
+                // tiny parts messages (never LLM candidates anyway) stay quiet.
                 let content = match msg.get("content") {
                     Some(Value::String(s)) => s.clone(),
-                    Some(Value::Array(_)) => {
-                        notes.push(format!("llm_skipped_parts_msg_{i}"));
+                    Some(Value::Array(parts)) => {
+                        let text_chars: usize =
+                            parts.iter().map(|p| part_text(p).chars().count()).sum();
+                        if text_chars >= min_chars {
+                            notes.push(format!("llm_skipped_parts_msg_{i}"));
+                        }
                         continue;
                     }
                     _ => continue,
@@ -260,10 +276,7 @@ impl Codec {
                     Ok(rewrite) => {
                         // Guard vs POST-RULES tokens; reject trivial/expanding
                         // rewrites and keep the rules output instead.
-                        if !rewrite.trim().is_empty()
-                            && rewrite.len() > 20
-                            && count_tokens(&rewrite) < count_tokens(&content)
-                        {
+                        if accept_rewrite(&rewrite, &content) {
                             self.cache.put(key, rewrite.clone());
                             set_content(msg, rewrite);
                             notes.push(format!("llm_encode_msg_{i}"));
@@ -272,6 +285,11 @@ impl Codec {
                         }
                     }
                     Err(e) => {
+                        tracing::warn!(
+                            msg_index = i,
+                            error = %e,
+                            "local LLM call failed; degrading to rules"
+                        );
                         notes.push(format!(
                             "llm_failed_msg_{i}:{}",
                             truncate_chars(&e.to_string(), 200)
@@ -326,10 +344,7 @@ impl Codec {
             } else {
                 match self.llm.encode_text(&out, target_ratio).await {
                     Ok(rewrite) => {
-                        if !rewrite.trim().is_empty()
-                            && rewrite.len() > 20
-                            && count_tokens(&rewrite) < count_tokens(&out)
-                        {
+                        if accept_rewrite(&rewrite, &out) {
                             self.cache.put(key, rewrite.clone());
                             out = rewrite;
                             notes.push("llm_encode".to_string());
@@ -338,6 +353,10 @@ impl Codec {
                         }
                     }
                     Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "local LLM call failed; degrading to rules"
+                        );
                         notes.push(format!(
                             "llm_failed:{}",
                             truncate_chars(&e.to_string(), 200)
@@ -350,5 +369,40 @@ impl Codec {
         let after = count_tokens(&out);
         let stats = TokenStats::new(before, after, self.cfg.stats.usd_per_mtok_input);
         (out, stats, notes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASELINE: &str =
+        "this is a much longer baseline sentence with many additional words to compress down";
+
+    #[test]
+    fn accept_rewrite_accepts_smaller_nontrivial_rewrite() {
+        // 23 bytes (> 20 floor) and clearly fewer tokens than BASELINE.
+        assert!(accept_rewrite("tiny compressed version", BASELINE));
+    }
+
+    #[test]
+    fn accept_rewrite_rejects_empty() {
+        assert!(!accept_rewrite("", BASELINE));
+        assert!(!accept_rewrite("   \n\t ", BASELINE));
+    }
+
+    #[test]
+    fn accept_rewrite_rejects_trivially_short() {
+        // 12 bytes: under the 20-byte floor even though it saves tokens.
+        assert!(!accept_rewrite("short output", BASELINE));
+    }
+
+    #[test]
+    fn accept_rewrite_rejects_not_strictly_smaller() {
+        // Identical text: equal token count, and the guard is strict.
+        assert!(!accept_rewrite(BASELINE, BASELINE));
+        // An expansion is rejected too.
+        let expansion = format!("{BASELINE} plus even more words tacked on the end");
+        assert!(!accept_rewrite(&expansion, BASELINE));
     }
 }

@@ -76,18 +76,6 @@ struct ChoiceMessage {
     content: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct ModelsList {
-    #[serde(default)]
-    data: Vec<ModelEntry>,
-}
-
-#[derive(Deserialize)]
-struct ModelEntry {
-    #[serde(default)]
-    id: String,
-}
-
 /// Truncate to at most `max` chars (not bytes) for log hygiene — response
 /// bodies are never emitted in full into error messages or logs.
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -206,8 +194,21 @@ impl LlmClient {
         match result {
             Ok(resp) => {
                 let status = resp.status();
-                let model_present = match resp.json::<ModelsList>().await {
-                    Ok(list) => Some(list.data.iter().any(|m| m.id == self.model)),
+                // `Some(...)` only when the body is a genuine OpenAI models
+                // listing — a JSON object with a `data` array. Anything else
+                // (non-JSON, `{"error": ...}`, exotic MLX shapes) is `None`,
+                // never a false `Some(false)`.
+                let model_present = match resp.json::<serde_json::Value>().await {
+                    Ok(body) => {
+                        body.get("data")
+                            .and_then(serde_json::Value::as_array)
+                            .map(|models| {
+                                models.iter().any(|m| {
+                                    m.get("id").and_then(serde_json::Value::as_str)
+                                        == Some(self.model.as_str())
+                                })
+                            })
+                    }
                     Err(_) => None,
                 };
                 LlmHealth {

@@ -124,6 +124,46 @@ async fn assistant_and_short_system_untouched() {
 }
 
 #[tokio::test]
+async fn encode_text_blob_accepts_smaller_rewrite() {
+    // The blob path (CLI encode / proxy /v1/completions) counts as in-scope
+    // last-user content: an accepted rewrite replaces the rules output.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "tiny compressed version"}, "finish_reason": "stop"}]})))
+        .mount(&server)
+        .await;
+    let codec = Codec::new(test_cfg(&server.uri()));
+    let (out, stats, notes) = codec
+        .encode_text(
+            "a long and fluffy prompt blob with plenty of words that the local model can shrink",
+            None,
+        )
+        .await;
+    assert_eq!(out, "tiny compressed version");
+    assert!(notes.iter().any(|n| n == "llm_encode"));
+    assert!(stats.after_tokens < stats.before_tokens);
+}
+
+#[tokio::test]
+async fn encode_text_blob_rejects_rewrite_not_smaller_than_rules_output() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "this rewrite is much much much longer than the rules output was, so it must be rejected by the token guard"}, "finish_reason": "stop"}]})))
+        .mount(&server)
+        .await;
+    let codec = Codec::new(test_cfg(&server.uri()));
+    let (out, _stats, notes) = codec
+        .encode_text("short-ish blob content for the guard test", None)
+        .await;
+    assert!(out.contains("guard test")); // kept the rules output
+    assert!(notes.iter().any(|n| n == "llm_rejected"));
+}
+
+#[tokio::test]
 async fn pure_fluff_message_keeps_original() {
     // Rules would empty "Thank you so much!" entirely; the codec must restore
     // the original content (never forward empty content upstream) and record a

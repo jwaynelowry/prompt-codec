@@ -68,6 +68,23 @@ async fn truncated_output_is_rejected() {
 }
 
 #[tokio::test]
+async fn health_model_present_is_none_for_unexpected_body_shape() {
+    // A reachable server whose /models body is not an OpenAI listing (no
+    // "data" array) must report model_present: None — informational unknown,
+    // never a false Some(false).
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"error": "x"})))
+        .mount(&server)
+        .await;
+    let (c, t) = cfg(&server.uri(), 5.0);
+    let h = LlmClient::new(&c, t).health().await;
+    assert!(h.ok); // status 200 — the server itself is fine
+    assert_eq!(h.model_present, None);
+}
+
+#[tokio::test]
 async fn health_probe_reports_ok_model_presence_and_down() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
