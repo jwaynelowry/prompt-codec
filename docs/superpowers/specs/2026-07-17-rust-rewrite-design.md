@@ -38,7 +38,8 @@ undermine both goals the user cares about — speed and cost:
 - **Faster requests**: no event-loop blocking, parallel request handling, local
   LLM consulted only where it pays for itself, instant-start static binary.
 - **Never corrupt a prompt**: fenced code and structured tool output pass
-  through byte-identical or provably-safe transformed (JSON minify).
+  through byte-identical or provably-safe transformed (JSON minify; exact
+  whole-duplicate fences replaced by a marker).
 - Drop-in replacement: same port (8787), same `/v1` paths, same YAML config
   shape — existing client configs keep working.
 
@@ -122,8 +123,12 @@ Per message role:
 
 LLM pass (mode `hybrid` or `local`):
 - Scope: `encoder.llm_scope: last_user` (default) — only the final `user`
-  message is sent to the local model. `all` and `none` available. This keeps
-  earlier history deterministic so upstream prompt caching works.
+  message is sent to the local model. `all` and `none` available. History
+  messages get rules **plus a cache lookup**: a rewrite accepted on an earlier
+  turn keeps its exact bytes on every later turn (for the life of the cache
+  entry), so compression savings persist and the upstream prompt-cache prefix
+  stays stable. On cache eviction or restart a history message falls back to
+  its rules-only form — a one-time prefix divergence, deterministic thereafter.
 - Eligibility: post-rules content ≥ `min_chars_to_compress` (default 400).
 - Guard: accept the rewrite only if its token count is **strictly lower than
   the post-rules token count** (v1 compared against the pre-rules original,
@@ -148,7 +153,8 @@ identical input always yields identical compressed output.
   headers are propagated on both streaming and non-streaming paths, so client
   error handling and retry logic see the truth. Adds response headers
   `x-prompt-codec-before`, `x-prompt-codec-after`, `x-prompt-codec-saved-pct`.
-- `POST /v1/completions`: same treatment for the string `prompt` field.
+- `POST /v1/completions`: the string `prompt` field gets the `user`-role
+  treatment (full rules pipeline; LLM-eligible as the "last user" content).
 - Catch-all `/v1/*`: forward method, path, **query params**, and raw body
   bytes untouched (v1 dropped non-JSON bodies and POST query params); stream
   response verbatim.
@@ -176,6 +182,13 @@ Lookup order: `--config` flag → `$PROMPT_CODEC_CONFIG` → `./config.yaml` →
 logged at startup. Unknown keys produce a **warning** naming the key (not a
 hard error — friendlier for hand-edited configs; a stale `decoder:` block
 warns and is ignored).
+
+Superseded v1 keys: `encoder.llm_timeout_s` alone governs the local-LLM
+request timeout — a present `local.timeout_s` is accepted-but-ignored with a
+warning (honoring it would silently resurrect v1's 120 s stalls for drop-in
+configs). `encoder.roles` is likewise ignored with a warning: per-role policy
+is fixed in v2 (user/system compressed, tool structure-safe, assistant
+untouched).
 
 Default local model: `gemma3:4b` (v1 shipped the nonexistent `gemma4:12b-mlx`).
 
