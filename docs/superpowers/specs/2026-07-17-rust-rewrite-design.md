@@ -110,7 +110,9 @@ Invariants (unit + property tested):
 - All fenced code is byte-identical after compression (except whole-duplicate
   removal).
 - Idempotent: `rules(rules(x)) == rules(x)`.
-- Never returns empty output for non-empty input.
+- Never returns empty output for input with real (non-boilerplate) content.
+  Pure-fluff input ("Thank you!") may compress to empty; the codec layer keeps
+  the original content whenever rules would empty a message entirely.
 
 ### codec — compression policy
 
