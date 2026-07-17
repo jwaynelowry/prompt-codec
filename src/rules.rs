@@ -1,5 +1,8 @@
 //! Deterministic, fence-aware prompt compression. Pure functions only.
 
+use regex::Regex;
+use std::sync::OnceLock;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Segment {
     Prose(String),
@@ -59,6 +62,123 @@ pub fn reassemble(segs: &[Segment]) -> String {
         }
     }
     out
+}
+
+fn boilerplate_res() -> &'static Vec<Regex> {
+    static RES: OnceLock<Vec<Regex>> = OnceLock::new();
+    RES.get_or_init(|| {
+        [
+            r"(?im)^[ \t]*please[, ]+(i would like you to |help me with |remember to )?",
+            r"(?im)^[ \t]*please\s+",
+            // terminal punctuation or end-of-line required: "thank you email" survives
+            r"(?im)\b(thank you|thanks)( so much)?( in advance)?(!|\.|$)[ \t]*",
+            // \b after "ai": "as an aid" survives
+            r"(?i)\bas an ai\b[^.!\n]*[.!]?[ \t]*",
+            r"(?i)\bi hope this helps[^.!\n]*[.!]?[ \t]*",
+            r"(?im)^[ \t]*i would like you to\s+",
+            // phrase-only: never consume the rest of the line
+            r"(?i)\b(write clean code|follow best practices|make it production ready)\b[.!,]?[ \t]*",
+            r"(?i)\badd comments where needed\b[.!,]?[ \t]*",
+            // pure-fluff lines only — meaningful "Important: <content>" lines survive
+            r"(?im)^[ \t]*[-*•]?[ \t]*(please be careful|be careful|this is important|note: this is important)[.!]?[ \t]*$",
+            r"(?im)^[ \t]*[-*•][ \t]*$",
+        ]
+        .iter()
+        .map(|p| Regex::new(p).unwrap())
+        .collect()
+    })
+}
+
+pub fn strip_boilerplate(text: &str) -> String {
+    let mut t = text.to_string();
+    for re in boilerplate_res() {
+        t = re.replace_all(&t, "").into_owned();
+    }
+    t
+}
+
+const DEDUPE_MIN_CHARS: usize = 12;
+
+pub fn dedupe_lines(text: &str) -> String {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for line in text.split('\n') {
+        let key = line.trim();
+        if key.chars().count() >= DEDUPE_MIN_CHARS && !seen.insert(key.to_string()) {
+            continue;
+        }
+        out.push(line);
+    }
+    out.join("\n")
+}
+
+pub fn collapse_whitespace(text: &str) -> String {
+    static BLANKS: OnceLock<Regex> = OnceLock::new();
+    static SPACES: OnceLock<Regex> = OnceLock::new();
+    let blanks = BLANKS.get_or_init(|| Regex::new(r"\n{3,}").unwrap());
+    let spaces = SPACES.get_or_init(|| Regex::new(r"[ \t]{2,}").unwrap());
+    let text = blanks.replace_all(text, "\n\n");
+    let lines: Vec<String> = text
+        .split('\n')
+        .map(|line| {
+            let line = line.trim_end();
+            if line.contains('`') {
+                return line.to_string(); // inline-code safety
+            }
+            let indent_len = line.len() - line.trim_start().len();
+            let (indent, rest) = line.split_at(indent_len);
+            format!("{indent}{}", spaces.replace_all(rest, " "))
+        })
+        .collect();
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod prose_tests {
+    use super::*;
+    #[test]
+    fn strips_please_prefix_and_thanks() {
+        let t = strip_boilerplate("Please help me with the auth bug.\nThank you so much in advance!\n");
+        assert!(!t.to_lowercase().contains("thank you"));
+        assert!(t.contains("the auth bug"));
+    }
+    #[test]
+    fn keeps_meaningful_important_lines() {
+        let t = strip_boilerplate("Important: do not delete the prod database\n");
+        assert!(t.contains("do not delete the prod database"));
+    }
+    #[test]
+    fn keeps_meaning_bearing_phrase_lookalikes() {
+        // v1 regressions the v2 patterns must not repeat:
+        let t = strip_boilerplate("write a thank you email to the team\n");
+        assert!(t.contains("thank you email"));
+        let t = strip_boilerplate("this serves as an aid to debugging\n");
+        assert!(t.contains("as an aid to debugging"));
+        let t = strip_boilerplate("Follow best practices and use bcrypt for hashing\n");
+        assert!(t.contains("use bcrypt for hashing")); // phrase-only removal, rest of line survives
+    }
+    #[test]
+    fn drops_pure_fluff_lines() {
+        let t = strip_boilerplate("- Please be careful\n- this is important\nreal content\n");
+        assert_eq!(t.trim(), "real content");
+    }
+    #[test]
+    fn dedupe_only_long_lines() {
+        let t = dedupe_lines("auth uses JWT tokens\nauth uses JWT tokens\n- ok\n- ok\n");
+        assert_eq!(t.matches("auth uses JWT tokens").count(), 1);
+        assert_eq!(t.matches("- ok").count(), 2); // short lines spared
+    }
+    #[test]
+    fn whitespace_preserves_indentation() {
+        let t = collapse_whitespace("    indented   with   runs\n\n\n\nnext");
+        assert!(t.starts_with("    indented with runs"));
+        assert!(!t.contains("\n\n\n"));
+    }
+    #[test]
+    fn backtick_lines_untouched_by_space_collapse() {
+        let t = collapse_whitespace("has `code  span`  here\n");
+        assert!(t.contains("`code  span`"));
+    }
 }
 
 #[cfg(test)]
