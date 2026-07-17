@@ -5,7 +5,13 @@ use tiktoken_rs::CoreBPE;
 static BPE: OnceLock<Option<CoreBPE>> = OnceLock::new();
 
 fn bpe() -> &'static Option<CoreBPE> {
-    BPE.get_or_init(|| tiktoken_rs::cl100k_base().ok())
+    BPE.get_or_init(|| match tiktoken_rs::cl100k_base() {
+        Ok(enc) => Some(enc),
+        Err(e) => {
+            tracing::warn!("failed to load cl100k_base encoder, falling back to chars/4: {e}");
+            None
+        }
+    })
 }
 
 pub fn count_tokens(text: &str) -> usize {
