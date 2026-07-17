@@ -1,0 +1,27 @@
+[project]
+name = "prompt-codec"
+version = "0.1.0"
+description = "Local coder/decoder that compresses prompts before paid LLM APIs to cut token cost."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.27",
+  "httpx>=0.27",
+  "pydantic>=2.6",
+  "pydantic-settings>=2.2",
+  "pyyaml>=6.0",
+  "tiktoken>=0.7",
+  "rich>=13.7",
+  "typer>=0.12",
+]
+
+[project.scripts]
+prompt-codec = "prompt_codec.cli:app"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["prompt_codec*"]

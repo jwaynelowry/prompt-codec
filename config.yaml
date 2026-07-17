@@ -1,0 +1,36 @@
+# Prompt Codec — local config
+# Local model encodes/decodes; paid API only sees compressed prompts.
+
+local:
+  base_url: "http://127.0.0.1:11434/v1"
+  api_key: "ollama"
+  model: "gemma4:12b-mlx"
+  timeout_s: 120
+  temperature: 0.1
+  max_tokens: 2048
+
+encoder:
+  # rules = free, no model | local = LLM rewrite | hybrid = both (recommended)
+  mode: hybrid
+  target_ratio: 0.45
+  protect_system_under_chars: 800
+  min_chars_to_compress: 400
+  rules_enabled: true
+  roles: ["user", "system", "tool"]
+
+decoder:
+  enabled: false
+  mode: "off"
+
+proxy:
+  host: "127.0.0.1"
+  port: 8787
+  # Change to your paid provider OpenAI-compatible base
+  upstream_base_url: "https://api.x.ai/v1"
+  upstream_api_key_env: "X_API_KEY"
+  pass_client_auth: true
+  log_stats: true
+
+stats:
+  encoding: "cl100k_base"
+  usd_per_mtok_input: 3.0
