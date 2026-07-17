@@ -3,11 +3,11 @@
 //! chain.
 
 use anyhow::Context;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LlmScope {
     #[default]
@@ -16,7 +16,7 @@ pub enum LlmScope {
     None,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct LocalConfig {
     pub base_url: String,
@@ -38,7 +38,7 @@ impl Default for LocalConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct EncoderConfig {
     pub mode: String,
@@ -66,7 +66,7 @@ impl Default for EncoderConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CacheConfig {
     pub max_entries: u64,
@@ -78,7 +78,7 @@ impl Default for CacheConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ProxyConfig {
     pub host: String,
@@ -104,7 +104,7 @@ impl Default for ProxyConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct StatsConfig {
     pub usd_per_mtok_input: f64,
@@ -118,7 +118,7 @@ impl Default for StatsConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AppConfig {
     pub local: LocalConfig,
@@ -130,6 +130,7 @@ pub struct AppConfig {
 
 /// A loaded config plus provenance: what file (if any) it came from, and any
 /// unknown/superseded keys that were dropped along the way.
+#[derive(Debug)]
 pub struct LoadedConfig {
     pub config: AppConfig,
     /// Human-readable provenance: the file path used, or "built-in defaults".
@@ -220,9 +221,10 @@ fn sanitize(mut value: Value, warnings: &mut Vec<String>) -> Value {
                         if known_keys.contains(&inner_key.as_str()) {
                             continue;
                         }
-                        let msg = superseded_message(section_name, inner_key).unwrap_or_else(|| {
-                            format!("unknown config key ignored: {section_name}.{inner_key}")
-                        });
+                        let msg =
+                            superseded_message(section_name, inner_key).unwrap_or_else(|| {
+                                format!("unknown config key ignored: {section_name}.{inner_key}")
+                            });
                         warnings.push(msg);
                         section_map.remove(inner_key.as_str());
                     }
@@ -297,7 +299,11 @@ pub fn resolve_config(explicit: Option<PathBuf>) -> anyhow::Result<LoadedConfig>
     }
     candidates.push(PathBuf::from("config.yaml"));
     if let Some(home) = dirs::home_dir() {
-        candidates.push(home.join(".config").join("prompt-codec").join("config.yaml"));
+        candidates.push(
+            home.join(".config")
+                .join("prompt-codec")
+                .join("config.yaml"),
+        );
     }
     resolve_config_with_candidates(explicit, &candidates)
 }
@@ -353,9 +359,53 @@ mod tests {
     fn superseded_stats_encoding_key_warns() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("config.yaml");
-        std::fs::write(&p, "stats:\n  encoding: cl100k_base\n  usd_per_mtok_input: 5.0\n").unwrap();
+        std::fs::write(
+            &p,
+            "stats:\n  encoding: cl100k_base\n  usd_per_mtok_input: 5.0\n",
+        )
+        .unwrap();
         let loaded = load_config_from(&p).unwrap();
         assert_eq!(loaded.config.stats.usd_per_mtok_input, 5.0);
         assert!(loaded.warnings.join("\n").contains("stats.encoding"));
+    }
+
+    #[test]
+    fn known_sections_map_covers_every_struct_field() {
+        // Anti-drift guard: serialize the default AppConfig (every section and
+        // field present by construction) and push it through the sanitize walk.
+        // Any struct field missing from KNOWN_SECTIONS would be stripped with a
+        // warning — so zero warnings proves the map is complete.
+        let value = serde_yaml::to_value(AppConfig::default()).unwrap();
+        let mut warnings = Vec::new();
+        let sanitized = sanitize(value, &mut warnings);
+        assert_eq!(
+            warnings,
+            Vec::<String>::new(),
+            "KNOWN_SECTIONS is out of sync with the config structs"
+        );
+        // And the sanitized value must still round-trip into an AppConfig.
+        let roundtripped: AppConfig = serde_yaml::from_value(sanitized).unwrap();
+        assert_eq!(roundtripped.local.model, "gemma3:4b");
+    }
+
+    #[test]
+    fn wrong_scalar_type_is_clean_error_with_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.yaml");
+        std::fs::write(&p, "proxy:\n  port: \"abc\"\n").unwrap();
+        let err = load_config_from(&p).unwrap_err();
+        assert!(format!("{err:#}").contains("config.yaml"));
+    }
+
+    #[test]
+    fn section_as_non_mapping_is_clean_error_with_path() {
+        // Pins today's behavior: a known section that isn't a mapping survives
+        // the sanitize walk untouched and fails typed deserialization with a
+        // clean, path-bearing error (no panic).
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.yaml");
+        std::fs::write(&p, "proxy: [1, 2]\n").unwrap();
+        let err = load_config_from(&p).unwrap_err();
+        assert!(format!("{err:#}").contains("config.yaml"));
     }
 }

@@ -1,11 +1,17 @@
 //! LRU cache: SHA-256(content|ratio|model) -> accepted LLM rewrite.
 use sha2::{Digest, Sha256};
 
+/// Bounded LRU cache of accepted LLM rewrites, keyed by
+/// [`RewriteCache::key`]. Backed by an Arc-based `moka::sync::Cache`, so
+/// clones are cheap handles onto the same underlying store — Task 9's codec
+/// and the proxy `AppState` share one cache this way.
+#[derive(Clone)]
 pub struct RewriteCache {
     inner: moka::sync::Cache<String, String>,
 }
 
 impl RewriteCache {
+    /// Create a cache bounded to `max_entries` entries (LRU-style eviction).
     pub fn new(max_entries: u64) -> Self {
         Self {
             inner: moka::sync::Cache::new(max_entries),
@@ -26,16 +32,31 @@ impl RewriteCache {
         hex::encode(h.finalize())
     }
 
+    /// Look up a previously accepted rewrite. Returns a clone of the cached
+    /// value and marks the entry as recently used.
     pub fn get(&self, key: &str) -> Option<String> {
         self.inner.get(key)
     }
 
+    /// Store an accepted rewrite under `key`, evicting LRU entries once the
+    /// cache exceeds its `max_entries` bound.
     pub fn put(&self, key: String, value: String) {
         self.inner.insert(key, value);
     }
 
+    /// Approximate number of live entries. Moka accounts for writes in
+    /// batches (eventual consistency), so this can lag recent `put`s; call
+    /// [`RewriteCache::sync`] first when an accurate reading matters.
     pub fn entry_count(&self) -> u64 {
         self.inner.entry_count()
+    }
+
+    /// Flush moka's pending internal tasks (batched write accounting,
+    /// evictions) so that [`RewriteCache::entry_count`] reflects all prior
+    /// writes. The `/health` endpoint (Task 11) calls this before reporting
+    /// `cache_entries`.
+    pub fn sync(&self) {
+        self.inner.run_pending_tasks();
     }
 }
 
@@ -57,5 +78,20 @@ mod tests {
         assert!(c.get(&k).is_none());
         c.put(k.clone(), "compressed".into());
         assert_eq!(c.get(&k).as_deref(), Some("compressed"));
+    }
+    #[test]
+    fn clones_share_the_underlying_store() {
+        let a = RewriteCache::new(16);
+        let b = a.clone();
+        a.put("k".into(), "v".into());
+        assert_eq!(b.get("k").as_deref(), Some("v"));
+    }
+    #[test]
+    fn entry_count_is_accurate_after_sync() {
+        let c = RewriteCache::new(16);
+        c.put("k1".into(), "v1".into());
+        c.put("k2".into(), "v2".into());
+        c.sync();
+        assert_eq!(c.entry_count(), 2);
     }
 }

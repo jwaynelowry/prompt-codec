@@ -8,7 +8,11 @@ pub enum Segment {
     Prose(String),
     /// `open` is the full opening line (e.g. "```python"), `body` the raw
     /// lines between markers, `close` the closing line or None if unclosed.
-    Fence { open: String, body: String, close: Option<String> },
+    Fence {
+        open: String,
+        body: String,
+        close: Option<String>,
+    },
 }
 
 fn is_fence_marker(line: &str) -> bool {
@@ -272,7 +276,8 @@ mod prose_tests {
     use super::*;
     #[test]
     fn strips_please_prefix_and_thanks() {
-        let t = strip_boilerplate("Please help me with the auth bug.\nThank you so much in advance!\n");
+        let t =
+            strip_boilerplate("Please help me with the auth bug.\nThank you so much in advance!\n");
         assert!(!t.to_lowercase().contains("thank you"));
         assert!(t.contains("the auth bug"));
     }
@@ -348,7 +353,9 @@ mod seg_tests {
         assert_eq!(reassemble(&segment(s)), s);
     }
     #[test]
-    fn plain_prose_roundtrips() { roundtrip("hello\nworld\n"); }
+    fn plain_prose_roundtrips() {
+        roundtrip("hello\nworld\n");
+    }
     #[test]
     fn fence_roundtrips() {
         roundtrip("before\n```python\ndef f():\n    return 1\n```\nafter");
@@ -362,8 +369,13 @@ mod seg_tests {
     #[test]
     fn fence_body_is_isolated() {
         let segs = segment("p1\n```rust\nlet x = 1;\n```\np2");
-        let bodies: Vec<_> = segs.iter().filter_map(|s| match s {
-            Segment::Fence { body, .. } => Some(body.as_str()), _ => None }).collect();
+        let bodies: Vec<_> = segs
+            .iter()
+            .filter_map(|s| match s {
+                Segment::Fence { body, .. } => Some(body.as_str()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(bodies, vec!["let x = 1;\n"]);
     }
     #[test]
