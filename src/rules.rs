@@ -149,7 +149,12 @@ pub fn rules_compress(text: &str) -> String {
     if text.trim().is_empty() {
         return text.to_string();
     }
-    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    // Fast path: the common no-CR case skips two full-string allocations.
+    let text = if text.contains('\r') {
+        std::borrow::Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    };
     let mut segs = segment(&text);
 
     // duplicate-fence removal (exact full-body match). A candidate always has a
@@ -209,9 +214,21 @@ mod pipeline_tests {
     }
     #[test]
     fn nonempty_in_nonempty_out() {
-        assert!(!rules_compress("Thank you!").trim().is_empty() || true);
-        // never empty for input that had real content:
+        // Rules-level non-emptiness is intentionally NOT asserted: pure-fluff
+        // input ("Thank you!") may legitimately compress to empty at this
+        // layer; the codec layer restores originals in that case (spec §rules).
+        // What we do guarantee: real content always survives.
         assert!(rules_compress("Thanks! Fix src/main.rs").contains("src/main.rs"));
+    }
+    #[test]
+    fn dedupe_is_global_across_prose_segments() {
+        let s = "auth uses JWT tokens everywhere\n```\nlet x = 1;\n```\nauth uses JWT tokens everywhere\nmore prose\n";
+        let out = rules_compress(s);
+        // second occurrence (in a later prose segment) removed...
+        assert_eq!(out.matches("auth uses JWT tokens everywhere").count(), 1);
+        // ...fence content untouched, surrounding prose intact
+        assert!(out.contains("let x = 1;\n"));
+        assert!(out.contains("more prose"));
     }
     #[test]
     fn idempotent_with_interior_whitespace_lines() {
@@ -295,6 +312,22 @@ mod prose_tests {
     fn backtick_lines_untouched_by_space_collapse() {
         let t = collapse_whitespace("has `code  span`  here\n");
         assert!(t.contains("`code  span`"));
+    }
+    #[test]
+    fn unicode_indentation_survives_space_collapse() {
+        // Guards the split_at byte-boundary invariant: `trim_start` trims
+        // Unicode whitespace (U+00A0 is 2 bytes in UTF-8), so the indent
+        // split must land on a char boundary — no panic, indent preserved,
+        // ASCII runs still collapsed. Protects against future refactors
+        // like widening `[ \t]` to `\s`.
+        let t = collapse_whitespace("\u{00A0}\u{00A0}two  spaced  words");
+        assert_eq!(t, "\u{00A0}\u{00A0}two spaced words");
+    }
+    #[test]
+    fn tab_indentation_preserved_while_interior_runs_collapse() {
+        let t = collapse_whitespace("\tindented\t\twith   runs\n");
+        assert!(t.starts_with("\tindented"));
+        assert_eq!(t, "\tindented with runs\n");
     }
     #[test]
     fn collapse_is_idempotent_on_whitespace_only_lines() {
