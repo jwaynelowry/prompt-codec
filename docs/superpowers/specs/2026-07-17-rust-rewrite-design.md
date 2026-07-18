@@ -28,7 +28,7 @@ undermine both goals the user cares about — speed and cost:
 5. The streaming path discards upstream status codes and headers, so a 401/429
    surfaces to clients as a 200 SSE stream.
 6. The decoder feature is dead code, the shipped default model tag
-   (`gemma4:12b-mlx`) does not exist, and config resolution breaks for
+   (`gemma4:12b-mlx`) was not available locally, and config resolution breaks for
    non-editable installs.
 
 ## Goals
@@ -213,7 +213,10 @@ configs). `encoder.roles` is likewise ignored with a warning: per-role policy
 is fixed in v2 (user/system compressed, tool structure-safe, assistant
 untouched).
 
-Default local model: `gemma3:4b` (v1 shipped the nonexistent `gemma4:12b-mlx`).
+Default local model: `gemma4:12b-mlx`. (History: the 2026-07 review initially
+flagged this tag as nonexistent based on stale model knowledge and swapped in
+`gemma3:4b`; Gemma 4 in fact shipped on Ollama in April 2026, so the tag is
+real and was restored as the recommended default. Do not re-revert.)
 
 ### CLI
 
@@ -279,7 +282,7 @@ Default local model: `gemma3:4b` (v1 shipped the nonexistent `gemma4:12b-mlx`).
 | `metadata` stats injected into upstream body | Removed; stats via headers + logs |
 | Streaming drops upstream status/headers | Verbatim passthrough with status/header propagation |
 | Decoder dead code | Dropped |
-| Nonexistent default model `gemma4:12b-mlx` | `gemma3:4b` |
+| Default model not pulled locally; health didn't surface it | `health` exits 1 when the model is absent; proxy warns at startup (tag `gemma4:12b-mlx` is real — Gemma 4 shipped 2026-04) |
 | Config path breaks when pip-installed; silent fallback | Explicit lookup order, logged source, unknown-key warnings |
 | Hybrid guard compares vs pre-rules tokens | Compares vs post-rules tokens |
 | Unauthenticated LAN callers spend the user's key | Documented; optional `require_client_auth`; default bind 127.0.0.1 |

@@ -32,6 +32,16 @@ impl Mode {
     }
 }
 
+/// Whether `prompt-codec health` should exit non-zero: the local endpoint is
+/// unreachable/erroring, OR it is reachable but the configured model is
+/// definitively absent from its listing (`model_present == Some(false)`) —
+/// in that state hybrid/local modes silently degrade to rules-only, which a
+/// health check must surface. `None` (listing shape unknown, e.g. some MLX
+/// servers) is not treated as failure.
+pub fn health_failed(ok: bool, model_present: Option<bool>) -> bool {
+    !ok || model_present == Some(false)
+}
+
 /// Resolve the input text for `encode`, in precedence order: `--file` wins
 /// over the positional `text` arg, which wins over piped stdin. Errors when
 /// none of the three are present.
@@ -141,5 +151,14 @@ mod tests {
         let notes = vec!["rules_compress".to_string(), "llm_encode".to_string()];
         let out = render_savings(&s, "hybrid", &notes);
         assert!(out.contains("Notes:  rules_compress, llm_encode"));
+    }
+
+    #[test]
+    fn health_fails_when_down_or_model_absent() {
+        assert!(health_failed(false, None)); // endpoint unreachable
+        assert!(health_failed(false, Some(true))); // erroring endpoint trumps listing
+        assert!(health_failed(true, Some(false))); // reachable but model not pulled
+        assert!(!health_failed(true, Some(true))); // healthy
+        assert!(!health_failed(true, None)); // unknown listing shape is not failure
     }
 }

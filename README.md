@@ -121,6 +121,12 @@ Add to `~/.factory/settings.json` `customModels`:
 Encoder **never answers the task** — it only rewrites the prompt.  
 If local encode fails, times out, or doesn't actually save tokens, it falls back to the rules output (or the original text, in `local` mode).
 
+Note: `hybrid` stays the configured mode even when the local model isn't
+available — requests then get the rules stage only (deterministic, still
+saves tokens) and each skipped local call is logged. `prompt-codec health`
+exits 1 and the proxy warns at startup when the configured model isn't
+pulled, so this degradation is never silent.
+
 ## v2 behavior notes
 
 A few things changed on purpose in the Rust rewrite — each one fixes a verified defect or gap in the legacy Python:

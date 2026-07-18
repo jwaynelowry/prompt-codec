@@ -31,7 +31,7 @@ impl Default for LocalConfig {
         Self {
             base_url: "http://127.0.0.1:11434/v1".to_string(),
             api_key: "ollama".to_string(),
-            model: "gemma3:4b".to_string(),
+            model: "gemma4:12b-mlx".to_string(),
             temperature: 0.1,
             max_tokens: 2048,
         }
@@ -322,7 +322,7 @@ mod tests {
     #[test]
     fn defaults_are_sane() {
         let c = AppConfig::default();
-        assert_eq!(c.local.model, "gemma3:4b");
+        assert_eq!(c.local.model, "gemma4:12b-mlx");
         assert_eq!(c.encoder.llm_timeout_s, 15.0);
         assert_eq!(c.encoder.llm_scope, LlmScope::LastUser);
         assert_eq!(c.proxy.port, 8787);
@@ -359,7 +359,7 @@ mod tests {
         // search-chain fn directly with an empty candidate list.
         let loaded = resolve_config_with_candidates(None, &[]).unwrap();
         assert_eq!(loaded.source, "built-in defaults");
-        assert_eq!(loaded.config.local.model, "gemma3:4b");
+        assert_eq!(loaded.config.local.model, AppConfig::default().local.model);
     }
 
     #[test]
@@ -409,7 +409,7 @@ mod tests {
         );
         // And the sanitized value must still round-trip into an AppConfig.
         let roundtripped: AppConfig = serde_yaml::from_value(sanitized).unwrap();
-        assert_eq!(roundtripped.local.model, "gemma3:4b");
+        assert_eq!(roundtripped.local.model, AppConfig::default().local.model);
     }
 
     #[test]

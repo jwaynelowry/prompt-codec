@@ -57,7 +57,7 @@ enum Cmd {
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
-    /// Check config + local model reachability (exit 1 if local model down)
+    /// Check config + local model (exit 1 if unreachable or model not pulled)
     Health {
         /// Path to a config file (default: search chain, then built-in defaults)
         #[arg(short, long)]
@@ -171,7 +171,8 @@ async fn main() -> anyhow::Result<()> {
 
             let llm = LlmClient::new(&loaded.config.local, loaded.config.encoder.llm_timeout_s);
             let health = llm.health().await;
-            let ok = health.ok;
+            let failed = prompt_codec::cli::health_failed(health.ok, health.model_present);
+            let model_absent = health.ok && health.model_present == Some(false);
             let payload = serde_json::json!({
                 "config_source": loaded.source,
                 "encoder_mode": loaded.config.encoder.mode,
@@ -180,7 +181,13 @@ async fn main() -> anyhow::Result<()> {
                 "upstream_key_env": loaded.config.proxy.upstream_api_key_env,
             });
             println!("{}", serde_json::to_string_pretty(&payload)?);
-            if !ok {
+            if model_absent {
+                eprintln!(
+                    "warning: local model '{}' is not pulled — hybrid/local modes will degrade to rules-only; run: ollama pull {}",
+                    loaded.config.local.model, loaded.config.local.model
+                );
+            }
+            if failed {
                 std::process::exit(1);
             }
         }
