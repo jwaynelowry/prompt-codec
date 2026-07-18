@@ -553,6 +553,87 @@ fn upstream_url(state: &AppState, suffix: &str) -> String {
     )
 }
 
+// --- Shared compressing-handler steps -----------------------------------------
+
+/// Parse a request body as JSON, or produce the ready-to-return 400 response.
+// The Err IS the response (same contract as the async `read_body`); it's built
+// once per malformed request, so its size is irrelevant — boxing would only
+// add noise at every call site.
+#[allow(clippy::result_large_err)]
+fn parse_json_body(bytes: &Bytes) -> Result<Value, Response> {
+    serde_json::from_slice(bytes).map_err(|_| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "invalid JSON body",
+        )
+    })
+}
+
+/// Serialize the (mutated) payload back to bytes, or produce the ready-to-return
+/// 400 response.
+// See `parse_json_body` for the allow rationale.
+#[allow(clippy::result_large_err)]
+fn payload_to_bytes(payload: &Value) -> Result<Bytes, Response> {
+    serde_json::to_vec(payload).map(Bytes::from).map_err(|_| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "failed to serialize request body",
+        )
+    })
+}
+
+/// Per-request stats log line, gated on `proxy.log_stats`. One shape for all
+/// three compressing routes; `route` disambiguates.
+fn log_encode(state: &AppState, route: &str, stats: &TokenStats, notes: &[String]) {
+    if state.cfg.proxy.log_stats {
+        tracing::info!(
+            route,
+            before = stats.before_tokens,
+            after = stats.after_tokens,
+            pct_saved = stats.pct_saved(),
+            notes = ?notes,
+            "encode",
+        );
+    }
+}
+
+/// The compress step shared by the two messages-list routes (OpenAI chat +
+/// Anthropic messages — the payload shapes align for the codec): take the
+/// non-empty `messages` array out of `payload` (else the 400), encode it,
+/// insert the result back, then log / count telemetry / push the recent-ring
+/// entry. Returns the `x-prompt-codec-*` headers for the forward call. Every
+/// other payload key (`model`, `system`, ...) is left exactly as received.
+async fn compress_messages_in_payload(
+    state: &AppState,
+    payload: &mut Value,
+    endpoint: &'static str,
+) -> Result<Vec<(HeaderName, HeaderValue)>, Response> {
+    // Move the array out (leaving an empty one behind) rather than deep-cloning
+    // a potentially large message list; the encoded result is inserted back.
+    let messages = match payload.get_mut("messages") {
+        Some(Value::Array(a)) if !a.is_empty() => std::mem::take(a),
+        _ => {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "messages required",
+            ))
+        }
+    };
+
+    let result = state.codec.encode_messages(messages).await;
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("messages".to_string(), Value::Array(result.messages));
+    }
+    log_encode(state, endpoint, &result.stats, &result.notes);
+    // Telemetry: a valid messages array always produces stats here, so count it.
+    record_and_maybe_flush(state, &result.stats);
+    push_recent(state, endpoint, &result.stats, &result.notes);
+    Ok(stat_headers(&result.stats))
+}
+
 // --- Chat completions --------------------------------------------------------
 
 /// `POST /v1/chat/completions`: compress `messages`, forward verbatim.
@@ -564,55 +645,18 @@ async fn chat_completions(State(state): State<Arc<AppState>>, request: Request) 
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let mut payload: Value = match serde_json::from_slice(&bytes) {
+    let mut payload = match parse_json_body(&bytes) {
         Ok(v) => v,
-        Err(_) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "invalid JSON body",
-            )
-        }
+        Err(resp) => return resp,
     };
-    // Move the array out (leaving an empty one behind) rather than deep-cloning
-    // a potentially large message list; the encoded result is inserted back.
-    let messages = match payload.get_mut("messages") {
-        Some(Value::Array(a)) if !a.is_empty() => std::mem::take(a),
-        _ => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "messages required",
-            )
-        }
-    };
-
-    let result = state.codec.encode_messages(messages).await;
-    if let Some(obj) = payload.as_object_mut() {
-        obj.insert("messages".to_string(), Value::Array(result.messages));
-    }
-    if state.cfg.proxy.log_stats {
-        tracing::info!(
-            before = result.stats.before_tokens,
-            after = result.stats.after_tokens,
-            pct_saved = result.stats.pct_saved(),
-            notes = ?result.notes,
-            "chat_completions encode",
-        );
-    }
-    // Telemetry: a valid messages array always produces stats here, so count it.
-    record_and_maybe_flush(&state, &result.stats);
-    push_recent(&state, "/v1/chat/completions", &result.stats, &result.notes);
-
-    let new_body = match serde_json::to_vec(&payload) {
-        Ok(b) => Bytes::from(b),
-        Err(_) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "failed to serialize request body",
-            )
-        }
+    let extra =
+        match compress_messages_in_payload(&state, &mut payload, "/v1/chat/completions").await {
+            Ok(headers) => headers,
+            Err(resp) => return resp,
+        };
+    let new_body = match payload_to_bytes(&payload) {
+        Ok(b) => b,
+        Err(resp) => return resp,
     };
     forward(
         &state,
@@ -621,15 +665,15 @@ async fn chat_completions(State(state): State<Arc<AppState>>, request: Request) 
         Some(HeaderValue::from_static("application/json")),
         client,
         new_body,
-        stat_headers(&result.stats),
+        extra,
         Some(state.totals.clone()),
     )
     .await
 }
 
 /// Fold one compressed request's stats into the totals and, on every 32nd
-/// counted request, flush them to the cache `meta` table. Shared by the two
-/// compressing handlers (chat + completions).
+/// counted request, flush them to the cache `meta` table. Shared by all three
+/// compressing handlers (chat + completions + messages).
 fn record_and_maybe_flush(state: &AppState, stats: &TokenStats) {
     let n = state
         .totals
@@ -675,15 +719,9 @@ async fn completions(State(state): State<Arc<AppState>>, request: Request) -> Re
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let mut payload: Value = match serde_json::from_slice(&bytes) {
+    let mut payload = match parse_json_body(&bytes) {
         Ok(v) => v,
-        Err(_) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "invalid JSON body",
-            )
-        }
+        Err(resp) => return resp,
     };
 
     let prompt = match payload.get("prompt") {
@@ -696,15 +734,7 @@ async fn completions(State(state): State<Arc<AppState>>, request: Request) -> Re
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("prompt".to_string(), Value::String(result.text));
         }
-        if state.cfg.proxy.log_stats {
-            tracing::info!(
-                before = result.stats.before_tokens,
-                after = result.stats.after_tokens,
-                pct_saved = result.stats.pct_saved(),
-                notes = ?result.notes,
-                "completions encode",
-            );
-        }
+        log_encode(&state, "/v1/completions", &result.stats, &result.notes);
         // Telemetry: only a non-empty string prompt produces stats (a missing
         // or non-string `prompt` is a passthrough and must not be counted).
         record_and_maybe_flush(&state, &result.stats);
@@ -712,15 +742,9 @@ async fn completions(State(state): State<Arc<AppState>>, request: Request) -> Re
         extra = stat_headers(&result.stats);
     }
 
-    let new_body = match serde_json::to_vec(&payload) {
-        Ok(b) => Bytes::from(b),
-        Err(_) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "failed to serialize request body",
-            )
-        }
+    let new_body = match payload_to_bytes(&payload) {
+        Ok(b) => b,
+        Err(resp) => return resp,
     };
     // Inspect the response only when we actually compressed (stats produced);
     // an uncompressed passthrough completion is not telemetry-counted.
@@ -753,55 +777,17 @@ async fn messages(State(state): State<Arc<AppState>>, request: Request) -> Respo
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let mut payload: Value = match serde_json::from_slice(&bytes) {
+    let mut payload = match parse_json_body(&bytes) {
         Ok(v) => v,
-        Err(_) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "invalid JSON body",
-            )
-        }
+        Err(resp) => return resp,
     };
-    // Move the array out (leaving an empty one behind) rather than deep-cloning;
-    // the encoded result is inserted back. The top-level `system` field and any
-    // other keys are left exactly as received.
-    let messages = match payload.get_mut("messages") {
-        Some(Value::Array(a)) if !a.is_empty() => std::mem::take(a),
-        _ => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "messages required",
-            )
-        }
+    let extra = match compress_messages_in_payload(&state, &mut payload, "/v1/messages").await {
+        Ok(headers) => headers,
+        Err(resp) => return resp,
     };
-
-    let result = state.codec.encode_messages(messages).await;
-    if let Some(obj) = payload.as_object_mut() {
-        obj.insert("messages".to_string(), Value::Array(result.messages));
-    }
-    if state.cfg.proxy.log_stats {
-        tracing::info!(
-            before = result.stats.before_tokens,
-            after = result.stats.after_tokens,
-            pct_saved = result.stats.pct_saved(),
-            notes = ?result.notes,
-            "messages encode",
-        );
-    }
-    record_and_maybe_flush(&state, &result.stats);
-    push_recent(&state, "/v1/messages", &result.stats, &result.notes);
-
-    let new_body = match serde_json::to_vec(&payload) {
-        Ok(b) => Bytes::from(b),
-        Err(_) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "failed to serialize request body",
-            )
-        }
+    let new_body = match payload_to_bytes(&payload) {
+        Ok(b) => b,
+        Err(resp) => return resp,
     };
     forward(
         &state,
@@ -810,7 +796,7 @@ async fn messages(State(state): State<Arc<AppState>>, request: Request) -> Respo
         Some(HeaderValue::from_static("application/json")),
         client,
         new_body,
-        stat_headers(&result.stats),
+        extra,
         Some(state.totals.clone()),
     )
     .await

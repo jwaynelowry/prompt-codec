@@ -294,7 +294,7 @@ pub fn load_config_from(path: &Path) -> anyhow::Result<LoadedConfig> {
         .with_context(|| format!("failed to parse YAML config: {}", path.display()))?;
     let mut warnings = Vec::new();
     let value = sanitize(value, &mut warnings);
-    let config: AppConfig = serde_yaml::from_value(value)
+    let mut config: AppConfig = serde_yaml::from_value(value)
         .with_context(|| format!("failed to load config: {}", path.display()))?;
     // Known-but-unimplemented knob: accepted so v1 configs load cleanly, but
     // the user deserves to know it does nothing.
@@ -302,6 +302,20 @@ pub fn load_config_from(path: &Path) -> anyhow::Result<LoadedConfig> {
         warnings.push(
             "encoder.list_trim_enabled is reserved and not implemented in v2; ignored".to_string(),
         );
+    }
+    // v0.3: the auth style is an enum-in-a-string; a typo (e.g. "x-api-key")
+    // would otherwise silently behave as bearer and surface only as an opaque
+    // upstream 401. Warn loudly at load time and fall back to bearer explicitly
+    // — consistent with this module's warn-don't-error posture.
+    if !matches!(
+        config.proxy.upstream_auth_style.as_str(),
+        "bearer" | "x_api_key"
+    ) {
+        warnings.push(format!(
+            "unknown proxy.upstream_auth_style '{}'; falling back to 'bearer' (valid: bearer, x_api_key)",
+            config.proxy.upstream_auth_style
+        ));
+        config.proxy.upstream_auth_style = "bearer".to_string();
     }
     Ok(LoadedConfig {
         config,
@@ -422,6 +436,32 @@ mod tests {
         std::fs::write(&p, "encoder:\n  list_trim_enabled: false\n").unwrap();
         let loaded = load_config_from(&p).unwrap();
         assert!(loaded.warnings.is_empty());
+    }
+
+    #[test]
+    fn invalid_upstream_auth_style_warns_and_falls_back_to_bearer() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.yaml");
+        // A plausible typo: the header name instead of the style name.
+        std::fs::write(&p, "proxy:\n  upstream_auth_style: \"x-api-key\"\n").unwrap();
+        let loaded = load_config_from(&p).unwrap();
+        assert_eq!(
+            loaded.config.proxy.upstream_auth_style, "bearer",
+            "invalid style must fall back to bearer explicitly"
+        );
+        let joined = loaded.warnings.join("\n");
+        assert!(
+            joined.contains("x-api-key") && joined.contains("bearer"),
+            "warning names the bad value and the fallback; got: {joined}"
+        );
+
+        // Both valid values load silently.
+        for style in ["bearer", "x_api_key"] {
+            std::fs::write(&p, format!("proxy:\n  upstream_auth_style: \"{style}\"\n")).unwrap();
+            let loaded = load_config_from(&p).unwrap();
+            assert_eq!(loaded.config.proxy.upstream_auth_style, style);
+            assert!(loaded.warnings.is_empty(), "valid '{style}' must not warn");
+        }
     }
 
     #[test]

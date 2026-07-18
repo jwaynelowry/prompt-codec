@@ -34,11 +34,11 @@ PY
 )"
 export Z_AI_API_KEY="$KEY"
 
+# Always build: an incremental no-op when nothing changed, and it guarantees
+# the demo reflects current source rather than a stale binary.
 BIN="$ROOT/target/release/prompt-codec"
-if [[ ! -x "$BIN" ]]; then
-  echo "Building release binary (first run)…" >&2
-  (cd "$ROOT" && cargo build --release)
-fi
+echo "Building release binary…" >&2
+(cd "$ROOT" && cargo build --release)
 
 echo "Dashboard: http://127.0.0.1:8788/dashboard"
 exec "$BIN" proxy --config "$ROOT/config.glm.yaml"

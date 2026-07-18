@@ -28,7 +28,7 @@
   td.num { text-align: right; font-variant-numeric: tabular-nums; }
   .yes { color: #2e9e44; font-weight: 600; }
   .no { opacity: .35; }
-  textarea, input[type=number] {
+  textarea, input[type=number], input[type=text] {
     font: inherit; padding: .5rem; border: 1px solid rgba(128,128,128,.4);
     border-radius: 6px; background: transparent; color: inherit;
   }
@@ -71,9 +71,10 @@
     <tbody id="recent"><tr><td colspan="7" class="empty">no requests yet</td></tr></tbody>
   </table>
 
-  <h2>Test drive (compress &rarr; GLM 5.2 &rarr; reply)</h2>
-  <textarea id="td-input" placeholder="Type a prompt. It is compressed by the codec, forwarded to GLM 5.2 via /v1/messages, and the reply plus savings headers are shown below."></textarea>
+  <h2>Test drive (compress &rarr; upstream model &rarr; reply)</h2>
+  <textarea id="td-input" placeholder="Type a prompt. It is compressed by the codec, forwarded to the upstream model via /v1/messages, and the reply plus savings headers are shown below."></textarea>
   <div class="row">
+    <label>model <input type="text" id="td-model" value="glm-5.2" style="width:9rem"></label>
     <label>max_tokens <input type="number" id="td-max" value="256" min="1" style="width:6rem"></label>
     <button id="td-send" onclick="send()">Send</button>
     <span class="stats" id="td-stats"></span>
@@ -88,6 +89,15 @@ function fmt(n) {
 function fmtTime(sec) {
   if (!sec) return "";
   return new Date(sec * 1000).toLocaleTimeString();
+}
+// Build a table cell via textContent so no data field ever rides innerHTML —
+// server fields are trusted-ish today (endpoint is a constant) but the row
+// builder must not depend on that.
+function cell(text, cls) {
+  const td = document.createElement("td");
+  if (cls) td.className = cls;
+  td.textContent = text;
+  return td;
 }
 
 async function loadHeader() {
@@ -114,20 +124,25 @@ async function poll() {
 
     const tbody = document.getElementById("recent");
     const rows = d.recent || [];
+    tbody.replaceChildren();
     if (rows.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="7" class="empty">no requests yet</td></tr>';
+      const td = cell("no requests yet", "empty");
+      td.colSpan = 7;
+      const tr = document.createElement("tr");
+      tr.appendChild(td);
+      tbody.appendChild(tr);
     } else {
-      tbody.innerHTML = rows.map(function (x) {
-        return "<tr>" +
-          "<td>" + fmtTime(x.ts_unix) + "</td>" +
-          "<td>" + x.endpoint + "</td>" +
-          '<td class="num">' + fmt(x.before_tokens) + "</td>" +
-          '<td class="num">' + fmt(x.after_tokens) + "</td>" +
-          '<td class="num">' + (x.pct_saved || 0).toFixed(1) + "</td>" +
-          '<td class="' + (x.cache_hit ? "yes" : "no") + '">' + (x.cache_hit ? "hit" : "—") + "</td>" +
-          '<td class="' + (x.llm_used ? "yes" : "no") + '">' + (x.llm_used ? "yes" : "—") + "</td>" +
-          "</tr>";
-      }).join("");
+      for (const x of rows) {
+        const tr = document.createElement("tr");
+        tr.appendChild(cell(fmtTime(x.ts_unix)));
+        tr.appendChild(cell(x.endpoint));
+        tr.appendChild(cell(fmt(x.before_tokens), "num"));
+        tr.appendChild(cell(fmt(x.after_tokens), "num"));
+        tr.appendChild(cell((x.pct_saved || 0).toFixed(1), "num"));
+        tr.appendChild(cell(x.cache_hit ? "hit" : "—", x.cache_hit ? "yes" : "no"));
+        tr.appendChild(cell(x.llm_used ? "yes" : "—", x.llm_used ? "yes" : "no"));
+        tbody.appendChild(tr);
+      }
     }
   } catch (e) { /* transient poll failure — keep the last view */ }
 }
@@ -135,6 +150,7 @@ async function poll() {
 async function send() {
   const btn = document.getElementById("td-send");
   const text = document.getElementById("td-input").value;
+  const model = document.getElementById("td-model").value.trim() || "glm-5.2";
   const maxTokens = parseInt(document.getElementById("td-max").value, 10) || 256;
   const out = document.getElementById("td-out");
   const stats = document.getElementById("td-stats");
@@ -147,7 +163,7 @@ async function send() {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        model: "glm-5.2",
+        model: model,
         max_tokens: maxTokens,
         messages: [{ role: "user", content: text }]
       })
