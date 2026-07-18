@@ -213,10 +213,14 @@ configs). `encoder.roles` is likewise ignored with a warning: per-role policy
 is fixed in v2 (user/system compressed, tool structure-safe, assistant
 untouched).
 
-Default local model: `gemma4:12b-mlx`. (History: the 2026-07 review initially
-flagged this tag as nonexistent based on stale model knowledge and swapped in
-`gemma3:4b`; Gemma 4 in fact shipped on Ollama in April 2026, so the tag is
-real and was restored as the recommended default. Do not re-revert.)
+Default local model: `qwen3.5:4b-mlx`, chosen by a 2026-07-18 corpus A/B
+(faster on every file, deeper savings, no truncations; see README). Fidelity
+at N=10 on the 14-fact probe: qwen 8/10 perfect runs (misses drop only a
+redundant context value), `gemma4:12b-mlx` 10/10 and deterministic — Gemma
+stays documented as the max-fidelity swap. (History: the 2026-07 review
+initially flagged `gemma4:12b-mlx` as nonexistent based on stale model
+knowledge and swapped in `gemma3:4b`; Gemma 4 shipped on Ollama April 2026.
+Do not change the default again without fresh A/B evidence.)
 
 ### CLI
 

@@ -15,15 +15,17 @@ use serde::Deserialize;
 use crate::config::LocalConfig;
 use crate::tokenizer::count_tokens;
 
-/// Ported verbatim from `legacy/prompt_codec/local_llm.py` (`ENCODE_SYSTEM`,
-/// the 8-rule PROMPT COMPRESSOR system prompt). Kept byte-for-byte so the
-/// local model's behavior matches v1 exactly.
+/// Ported from `legacy/prompt_codec/local_llm.py` (`ENCODE_SYSTEM`, the
+/// 8-rule PROMPT COMPRESSOR system prompt), with rule 1 tightened on
+/// 2026-07-18 after a fidelity probe showed qwen3.5:4b dropping a TTL:
+/// durations/TTLs/timeouts, limits/thresholds, and quantities-with-units are
+/// now named explicitly ("numbers" alone was not enough).
 pub const ENCODE_SYSTEM: &str = r#"You are a PROMPT COMPRESSOR for paid LLM APIs.
 Your job: rewrite the user's message so a strong cloud model still does the task correctly,
 but with far fewer tokens.
 
 Hard rules:
-1. Preserve: goals, constraints, file paths, function/class names, error text, exact quotes, IDs, URLs, numbers, acceptance criteria.
+1. Preserve: goals, constraints, file paths, function/class names, error text, exact quotes, IDs, URLs, numbers, durations/TTLs/timeouts, limits and thresholds, quantities with their units, version numbers, acceptance criteria. Every concrete value in the original must appear in your output.
 2. Remove: fluff, politeness, repetition, obvious commentary, restated instructions, markdown decoration that adds no info.
 3. Prefer: short imperative bullets, dense technical English, tables only if denser than prose.
 4. Do NOT answer the task. Only output the compressed prompt text.
@@ -126,8 +128,11 @@ impl LlmClient {
     /// on any error and never propagates it to the request.
     pub async fn encode_text(&self, text: &str, target_ratio: f64) -> anyhow::Result<String> {
         let pct = ((target_ratio * 100.0) as i64).clamp(5, 95);
+        // The trailing reminder is load-bearing for small models: without it
+        // qwen3.5:4b deterministically drops standalone value facts (e.g. a
+        // "TTL is 30 days" bullet) — probed 2026-07-18, see README A/B notes.
         let user = format!(
-            "Target length: about {pct}% of the original token count.\n\n--- ORIGINAL PROMPT ---\n{text}\n--- END ---"
+            "Target length: about {pct}% of the original token count.\n\n--- ORIGINAL PROMPT ---\n{text}\n--- END ---\n\nCarry over EVERY concrete value from the original (paths, IDs, error text, durations, TTLs, limits, versions). A compressed prompt missing any of them is wrong."
         );
         // Size the output budget to the job so a legitimate compression fits,
         // capped by config. `max(256)` on the ceiling keeps clamp bounds valid

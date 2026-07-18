@@ -192,6 +192,25 @@ Python looks like it compresses harder on `code_heavy.md` and `tool_dump.json` �
 
 Rust's `rules` pipeline segments prose from fenced blocks first and never runs boilerplate/dedupe/whitespace transforms inside a fence — only an exact whole-body duplicate fence gets collapsed to a marker. That's why `tool_dump.json` comes back byte-identical (`rust_after == before`): the entire payload is one JSON fence, so there's nothing outside a fence to touch. On plain prose (`fluffy.txt`) the two are close (175 vs. 162 tokens); the small gap is Python's boilerplate regexes dropping the rest of a matched line where Rust's phrase-only patterns only remove the fluff phrase and keep the rest. Bottom line: v2 refuses transforms it can't prove are safe, even at the cost of a few percentage points of savings on code-heavy input.
 
+## A/B: local models (hybrid mode, 2026-07-18)
+
+Same corpus, hybrid mode, 15s budget, warm model, median of 3 timed runs:
+
+| file | rules only | `gemma4:12b-mlx` | `qwen3.5:4b-mlx` |
+|------|-----------|------------------|-------------------|
+| fluffy.txt | 175 | 113 tok, 1.83s | **88 tok, 1.16s** |
+| code_heavy.md | 775 | 377 tok, 5.78s | **261 tok, 4.22s** |
+| tool_dump.json | 667 | failed (truncated), 5.15s wasted | **258 tok, 3.65s** |
+
+qwen is the default: faster everywhere, deeper savings, and it handles large
+fenced-JSON rewrites Gemma truncates on. **Fidelity** (14 planted facts,
+N=10 runs, normalized matching): qwen keeps all 14 in 8/10 runs — its rare
+misses drop a single redundant context value (a TTL bullet), never paths,
+error text, or IDs. `gemma4:12b-mlx` keeps 14/14 in 10/10 runs with
+byte-identical output — it stays pulled as the max-fidelity swap
+(`local.model`, one line) when a prompt is sacred. Known, accepted trade-off;
+re-run this A/B before ever changing the default.
+
 ## Safety / quality
 
 - Paths, errors, IDs, and code evidence are preserved by construction (fence-safe rules) and by instruction (the local-LLM system prompt).
