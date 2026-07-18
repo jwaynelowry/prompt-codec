@@ -161,6 +161,7 @@ async fn pin_posts_native_generate() {
             "model": LocalConfig::default().model,
             "prompt": "",
             "keep_alive": "60m",
+            "stream": false,
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"done": true})))
         .expect(1)
@@ -186,9 +187,31 @@ async fn pin_stops_after_unsupported() {
     let llm = LlmClient::new(&c, t);
     let _ = tokio::time::timeout(
         std::time::Duration::from_millis(300),
-        keep_alive_loop(llm, "60m".to_string(), std::time::Duration::from_millis(50)),
+        keep_alive_loop(
+            llm,
+            "60m".to_string(),
+            Some(std::time::Duration::from_millis(50)),
+        ),
     )
     .await;
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn negative_keep_alive_pins_exactly_once() {
+    // "-1" = Ollama keeps the model loaded forever; one successful pin
+    // suffices and the loop must exit on its own (interval None) rather
+    // than re-pin.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/generate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"done": true})))
+        .mount(&server)
+        .await;
+    let (c, t) = cfg(&server.uri(), 5.0);
+    let llm = LlmClient::new(&c, t);
+    // No timeout wrapper: the loop itself must return after the first pin.
+    keep_alive_loop(llm, "-1".to_string(), None).await;
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 

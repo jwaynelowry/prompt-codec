@@ -20,11 +20,13 @@ local:
                                              # servers that reject it
   # Warm-model keep-alive pinner (v0.3, proxy only, local/hybrid mode only):
   # pins the model resident via Ollama's native /api/generate call on startup
-  # and every 20 minutes, so hybrid latency stays ~1s instead of paying
-  # Ollama's ~10s cold reload after its default ~5 min idle unload. "" disables
-  # pinning; non-Ollama servers (MLX-LM, Exo) log one warning and stop after
-  # the first failed attempt — never retry-spammed.
-  keep_alive: "60m"                          # default: 60m
+  # and every half this window thereafter (never more often than once a
+  # minute), so hybrid latency stays ~1s instead of paying Ollama's ~10s cold
+  # reload after its default ~5 min idle unload. Accepts "90s"/"10m"/"1h" or
+  # bare seconds ("300"); "-1" = keep loaded forever (pinned once); "" disables
+  # pinning entirely. Non-Ollama servers (MLX-LM, Exo) log one warning and
+  # stop after the first failed attempt — never retry-spammed.
+  keep_alive: "60m"                          # default: 60m (re-pinned every 30m)
 
 encoder:
   # rules  = free deterministic compression only, no model needed

@@ -228,6 +228,7 @@ impl LlmClient {
             "model": self.model,
             "prompt": "",
             "keep_alive": keep_alive,
+            "stream": false,
         });
         let resp = self
             .http
@@ -239,6 +240,9 @@ impl LlmClient {
             .await
             .context("keep-alive pin request failed")?;
         let status = resp.status();
+        // Drain the (tiny) body either way so the connection returns to the
+        // pool cleanly instead of being torn down mid-response.
+        let _ = resp.bytes().await;
         if !status.is_success() {
             anyhow::bail!("keep-alive pin returned {}", status);
         }
@@ -299,19 +303,104 @@ impl LlmClient {
     }
 }
 
+/// Parse the common Ollama `keep_alive` duration forms: `"90s"`, `"10m"`,
+/// `"1h"`, and bare seconds like `"300"`. Anything else (garbage, negative,
+/// composite Go strings like `"1h30m"`) is `None` — callers decide the
+/// fallback. Negative windows never reach this function on the interval
+/// path; [`repin_interval`] short-circuits them first.
+fn parse_ollama_duration(s: &str) -> Option<Duration> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    // Bare integer = seconds (Ollama's numeric form).
+    if let Ok(n) = t.parse::<u64>() {
+        return Some(Duration::from_secs(n));
+    }
+    let unit = t.chars().last()?;
+    let n: u64 = t[..t.len() - unit.len_utf8()].parse().ok()?;
+    let secs = match unit {
+        's' => n,
+        'm' => n.checked_mul(60)?,
+        'h' => n.checked_mul(3600)?,
+        _ => return None,
+    };
+    Some(Duration::from_secs(secs))
+}
+
+/// Derive the re-pin cadence from the configured `local.keep_alive` window,
+/// so a short window (say `"10m"`) is re-pinned before the model unloads
+/// rather than on a fixed 20-minute clock.
+///
+/// - Parseable window → re-pin every half the window, floored at 60 s.
+/// - Negative window (`"-1"`) → Ollama keeps the model loaded forever, so
+///   one pin suffices: `None` = pin once, no repeat.
+/// - Unparseable → warn once and fall back to every 20 minutes.
+pub fn repin_interval(keep_alive: &str) -> Option<Duration> {
+    if keep_alive.trim().starts_with('-') {
+        return None;
+    }
+    Some(match parse_ollama_duration(keep_alive) {
+        Some(window) => (window / 2).max(Duration::from_secs(60)),
+        None => {
+            tracing::warn!(
+                configured = keep_alive,
+                "unparseable local.keep_alive; re-pinning every 20 minutes"
+            );
+            Duration::from_secs(20 * 60)
+        }
+    })
+}
+
 /// Background keep-alive task for the proxy (never spawned for CLI
 /// one-shots, and only when `encoder.mode` is `local`/`hybrid` — see the
 /// proxy startup arm in `main.rs`). Pins the model immediately, then again
-/// every `interval`. On the FIRST failed pin — a non-Ollama server (MLX-LM,
-/// Exo) 404ing or refusing the native endpoint — logs one warning and
-/// returns for good, so a server that will never support this call is never
-/// retry-spammed.
-pub async fn keep_alive_loop(llm: LlmClient, keep_alive: String, interval: Duration) {
+/// every `interval`; `None` (a negative keep-alive window = infinite
+/// residency) pins exactly once. On the FIRST failed pin — a non-Ollama
+/// server (MLX-LM, Exo) 404ing or refusing the native endpoint — logs one
+/// warning and returns for good, so a server that will never support this
+/// call is never retry-spammed.
+pub async fn keep_alive_loop(llm: LlmClient, keep_alive: String, interval: Option<Duration>) {
     loop {
         if let Err(e) = llm.pin_model(&keep_alive).await {
             tracing::warn!("keep-alive pinning disabled: {e:#}");
             return;
         }
-        tokio::time::sleep(interval).await;
+        match interval {
+            Some(d) => tokio::time::sleep(d).await,
+            None => return,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_common_ollama_duration_forms() {
+        assert_eq!(parse_ollama_duration("90s"), Some(Duration::from_secs(90)));
+        assert_eq!(parse_ollama_duration("10m"), Some(Duration::from_secs(600)));
+        assert_eq!(parse_ollama_duration("1h"), Some(Duration::from_secs(3600)));
+        assert_eq!(parse_ollama_duration("300"), Some(Duration::from_secs(300)));
+        assert_eq!(parse_ollama_duration("garbage"), None);
+        assert_eq!(parse_ollama_duration("5x"), None);
+        assert_eq!(parse_ollama_duration("-1"), None);
+        assert_eq!(parse_ollama_duration(""), None);
+    }
+
+    #[test]
+    fn repin_interval_follows_the_window() {
+        // Half the window: 60m → every 30 minutes.
+        assert_eq!(repin_interval("60m"), Some(Duration::from_secs(30 * 60)));
+        // Short windows floor at 60 s, never busy-pin.
+        assert_eq!(repin_interval("90s"), Some(Duration::from_secs(60)));
+        // Negative = infinite residency: pin once, no repeat.
+        assert_eq!(repin_interval("-1"), None);
+        // Unparseable falls back to the 20-minute default.
+        assert_eq!(
+            repin_interval("garbage"),
+            Some(Duration::from_secs(20 * 60))
+        );
     }
 }

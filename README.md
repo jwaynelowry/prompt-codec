@@ -149,7 +149,7 @@ See `config.yaml` (your live config) / `config.example.yaml` (fully commented v2
 | `local.reasoning_effort` | `none` | stops thinking models burning the output budget on hidden reasoning; `""` omits the field |
 | `local.temperature` | `0.1` | |
 | `local.max_tokens` | `2048` | ceiling; actual budget is sized per call |
-| `local.keep_alive` **(new in v0.3)** | `60m` | model residency window pinned via Ollama's native `/api/generate` call (proxy only, `local`/`hybrid` mode only); `""` disables pinning. Non-Ollama servers log one warning and stop after the first failed pin attempt |
+| `local.keep_alive` **(new in v0.3)** | `60m` | model residency window pinned via Ollama's native `/api/generate` call (proxy only, `local`/`hybrid` mode only); re-pinned every half the window (min 60s), so the cadence follows the value; `"-1"` = keep loaded forever (pinned once); `""` disables pinning. Non-Ollama servers log one warning and stop after the first failed pin attempt |
 | `encoder.mode` | `hybrid` | `rules` \| `local` \| `hybrid` |
 | `encoder.target_ratio` | `0.45` | local-LLM target compression |
 | `encoder.protect_system_under_chars` | `800` | leave short system prompts alone |
