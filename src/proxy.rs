@@ -13,15 +13,17 @@
 //!   header isn't itself loopback are rejected 403 — a malicious web page can't
 //!   drive the localhost proxy and spend the user's upstream API key.
 
+use std::collections::VecDeque;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
-use axum::http::{header, HeaderName, HeaderValue, Method, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use futures_core::Stream;
@@ -33,6 +35,18 @@ use crate::config::{AppConfig, ProxyConfig};
 use crate::llm::LlmHealth;
 use crate::stats::{round_to, TokenStats};
 use crate::telemetry::{extract_cached_tokens, TailBuffer, Totals, TotalsSnapshot};
+
+/// The `x-api-key` request-header name (Anthropic-style upstream auth). A
+/// module constant so the client-passthrough read and the upstream-set share
+/// one spelling.
+const X_API_KEY: &str = "x-api-key";
+
+/// Anthropic protocol version forwarded in `x_api_key` mode when the client
+/// didn't send its own `anthropic-version` header.
+const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// Cap on the in-memory recent-requests ring surfaced by the dashboard.
+const RECENT_CAP: usize = 20;
 
 /// Shared proxy state, built once in [`create_app`] and reused for the process
 /// lifetime behind an `Arc`.
@@ -46,12 +60,36 @@ pub struct AppState {
     /// without ever truncating a long *active* stream.
     pub upstream: reqwest::Client,
     /// `Bearer {key}` from the env var named by `proxy.upstream_api_key_env`,
-    /// resolved once at startup. `None` when unset/empty.
+    /// resolved once at startup. `None` when unset/empty. Used in `bearer`
+    /// auth style.
     pub env_bearer: Option<HeaderValue>,
+    /// The RAW upstream key from the same env var, resolved once at startup,
+    /// sent verbatim as `x-api-key` in `x_api_key` auth style (v0.3 Feature 4).
+    /// `None` when unset/empty.
+    pub env_x_api_key: Option<HeaderValue>,
     /// Cumulative savings telemetry (v0.3 Feature 3): atomic counters loaded
     /// from the cache `meta` table at startup and flushed back on `/health`,
     /// every 32 counted requests, and at graceful shutdown.
     pub totals: Arc<Totals>,
+    /// Session-only ring of the last [`RECENT_CAP`] compressed requests, shown
+    /// by the draft dashboard (v0.3 Feature 4c). Not persisted.
+    pub recent: Mutex<VecDeque<RecentEntry>>,
+}
+
+/// One row in the dashboard's recent-requests ring: the compression outcome of
+/// a single request through a compressing route. Serialized directly into the
+/// `/dashboard/data` `recent` array.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecentEntry {
+    pub ts_unix: u64,
+    pub endpoint: String,
+    pub before_tokens: u64,
+    pub after_tokens: u64,
+    pub pct_saved: f64,
+    /// A cached rewrite was reused (any `cache_hit` note).
+    pub cache_hit: bool,
+    /// The local model produced an accepted rewrite (any `llm_encode` note).
+    pub llm_used: bool,
 }
 
 /// Flush the current totals snapshot to the cache `meta` table. A no-op when
@@ -86,10 +124,18 @@ pub fn create_app_with_state(cfg: AppConfig, config_source: String) -> (Router, 
         .read_timeout(std::time::Duration::from_secs(120))
         .build()
         .expect("failed to build upstream reqwest client");
-    let env_bearer = std::env::var(&cfg.proxy.upstream_api_key_env)
+    // The upstream key is read once and pre-formatted into BOTH auth shapes so
+    // the request path never re-reads the env or re-formats: `Bearer {key}` for
+    // `bearer` style, the raw value for `x_api_key` style.
+    let env_raw = std::env::var(&cfg.proxy.upstream_api_key_env)
         .ok()
-        .filter(|v| !v.is_empty())
+        .filter(|v| !v.is_empty());
+    let env_bearer = env_raw
+        .as_deref()
         .and_then(|v| HeaderValue::from_str(&format!("Bearer {v}")).ok());
+    let env_x_api_key = env_raw
+        .as_deref()
+        .and_then(|v| HeaderValue::from_str(v).ok());
     let codec = Codec::new(cfg.clone());
     // Lifetime totals: load a prior `totals_json` row (absent/corrupt → fresh,
     // warned inside `Totals::load`). Without a disk tier `meta_get` is `None`,
@@ -101,13 +147,21 @@ pub fn create_app_with_state(cfg: AppConfig, config_source: String) -> (Router, 
         codec,
         upstream,
         env_bearer,
+        env_x_api_key,
         totals,
+        recent: Mutex::new(VecDeque::with_capacity(RECENT_CAP)),
     });
 
     let router = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
+        // Anthropic passthrough (v0.3 Feature 4a): compress `messages`, forward
+        // to `{base}/messages`. A specific route, so it wins over the wildcard.
+        .route("/v1/messages", post(messages))
         .route("/health", get(health))
+        // Draft dashboard (v0.3 Feature 4c): self-contained page + its poll feed.
+        .route("/dashboard", get(dashboard))
+        .route("/dashboard/data", get(dashboard_data))
         // axum 0.8 wildcard: catches every other /v1/* path, any method.
         .route("/v1/{*path}", any(catch_all))
         .layer(axum::middleware::from_fn_with_state(
@@ -233,34 +287,79 @@ fn stat_headers(stats: &TokenStats) -> Vec<(HeaderName, HeaderValue)> {
 
 // --- Auth resolution ---------------------------------------------------------
 
-/// What Authorization to send upstream for this request.
+/// The client-supplied request headers `forward` may need to relay upstream:
+/// the two auth shapes plus the Anthropic protocol version. Extracted once per
+/// handler from the incoming request via [`client_headers`].
+#[derive(Default)]
+struct ClientHeaders {
+    authorization: Option<HeaderValue>,
+    x_api_key: Option<HeaderValue>,
+    anthropic_version: Option<HeaderValue>,
+}
+
+/// Pull the auth/version headers out of an incoming request's header map.
+fn client_headers(headers: &HeaderMap) -> ClientHeaders {
+    ClientHeaders {
+        authorization: headers.get(header::AUTHORIZATION).cloned(),
+        x_api_key: headers.get(X_API_KEY).cloned(),
+        anthropic_version: headers.get("anthropic-version").cloned(),
+    }
+}
+
+/// Is this config using the Anthropic-style `x-api-key` upstream auth?
+fn is_x_api_key_style(cfg: &ProxyConfig) -> bool {
+    cfg.upstream_auth_style == "x_api_key"
+}
+
+/// What auth header to send upstream for this request.
 enum AuthDecision {
     /// `require_client_auth` is set and the client sent none -> 401.
     Reject,
-    /// Send this exact `Authorization` value.
-    Header(HeaderValue),
-    /// Send no `Authorization` header at all.
+    /// Send this exact header (`Authorization` or `x-api-key`).
+    Header(HeaderName, HeaderValue),
+    /// Send no auth header at all.
     None,
 }
 
-/// Resolve the upstream auth per config: reject when required-but-absent; else
-/// forward the client's Authorization when `pass_client_auth`; else fall back
-/// to the startup-resolved `Bearer {env}` value when present.
+/// Resolve the upstream auth per config and auth style.
+///
+/// - `bearer` (default): reject when required-but-absent; else forward the
+///   client's `Authorization` under `pass_client_auth`; else fall back to the
+///   startup-resolved `Bearer {env}` value.
+/// - `x_api_key` (Anthropic-style): `require_client_auth` is satisfied by
+///   EITHER a client `x-api-key` or `Authorization`; passthrough forwards the
+///   client's `x-api-key`; else fall back to the raw env key as `x-api-key`.
 fn resolve_auth(
     cfg: &ProxyConfig,
     env_bearer: Option<&HeaderValue>,
-    client_auth: Option<&HeaderValue>,
+    env_x_api_key: Option<&HeaderValue>,
+    client: &ClientHeaders,
 ) -> AuthDecision {
-    if cfg.require_client_auth && client_auth.is_none() {
+    if is_x_api_key_style(cfg) {
+        if cfg.require_client_auth && client.x_api_key.is_none() && client.authorization.is_none() {
+            return AuthDecision::Reject;
+        }
+        if cfg.pass_client_auth {
+            if let Some(v) = &client.x_api_key {
+                return AuthDecision::Header(HeaderName::from_static(X_API_KEY), v.clone());
+            }
+        }
+        if let Some(v) = env_x_api_key {
+            return AuthDecision::Header(HeaderName::from_static(X_API_KEY), v.clone());
+        }
+        return AuthDecision::None;
+    }
+
+    if cfg.require_client_auth && client.authorization.is_none() {
         return AuthDecision::Reject;
     }
     if cfg.pass_client_auth {
-        if let Some(v) = client_auth {
-            return AuthDecision::Header(v.clone());
+        if let Some(v) = &client.authorization {
+            return AuthDecision::Header(header::AUTHORIZATION, v.clone());
         }
     }
     if let Some(hv) = env_bearer {
-        return AuthDecision::Header(hv.clone());
+        return AuthDecision::Header(header::AUTHORIZATION, hv.clone());
     }
     AuthDecision::None
 }
@@ -381,9 +480,9 @@ fn stream_response(
 
 /// Send `body` upstream to `url` with the given method, optional content-type,
 /// and resolved auth; stream the reply back. The single forward path used by
-/// the chat, completions, and catch-all routes. `inspect` carries the totals
-/// handle for the compressing routes (tail cached-token capture); the catch-all
-/// passes `None`, so its traffic is never touched.
+/// the chat, completions, messages, and catch-all routes. `inspect` carries the
+/// totals handle for the compressing routes (tail cached-token capture); the
+/// catch-all passes `None`, so its traffic is never touched.
 // The arg list is the request shape for the ONE shared forward path — keeping
 // them positional (rather than a params struct) preserves the verbatim
 // passthrough design and each call site reads as a plain forward.
@@ -393,7 +492,7 @@ async fn forward(
     method: Method,
     url: String,
     content_type: Option<HeaderValue>,
-    client_auth: Option<HeaderValue>,
+    client: ClientHeaders,
     body: Bytes,
     extra: Vec<(HeaderName, HeaderValue)>,
     inspect: Option<Arc<Totals>>,
@@ -401,7 +500,8 @@ async fn forward(
     let auth = match resolve_auth(
         &state.cfg.proxy,
         state.env_bearer.as_ref(),
-        client_auth.as_ref(),
+        state.env_x_api_key.as_ref(),
+        &client,
     ) {
         AuthDecision::Reject => {
             return error_response(
@@ -410,7 +510,7 @@ async fn forward(
                 "client authentication required",
             )
         }
-        AuthDecision::Header(v) => Some(v),
+        AuthDecision::Header(name, v) => Some((name, v)),
         AuthDecision::None => None,
     };
 
@@ -418,8 +518,16 @@ async fn forward(
     if let Some(ct) = content_type {
         req = req.header(header::CONTENT_TYPE, ct);
     }
-    if let Some(a) = auth {
-        req = req.header(header::AUTHORIZATION, a);
+    if let Some((name, v)) = auth {
+        req = req.header(name, v);
+    }
+    // Anthropic-style upstreams require an `anthropic-version` header; forward
+    // the client's when present, else the documented default.
+    if is_x_api_key_style(&state.cfg.proxy) {
+        let ver = client
+            .anthropic_version
+            .unwrap_or_else(|| HeaderValue::from_static(DEFAULT_ANTHROPIC_VERSION));
+        req = req.header("anthropic-version", ver);
     }
     req = req.body(body);
 
@@ -450,7 +558,7 @@ fn upstream_url(state: &AppState, suffix: &str) -> String {
 /// `POST /v1/chat/completions`: compress `messages`, forward verbatim.
 async fn chat_completions(State(state): State<Arc<AppState>>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
-    let client_auth = parts.headers.get(header::AUTHORIZATION).cloned();
+    let client = client_headers(&parts.headers);
 
     let bytes = match read_body(body).await {
         Ok(b) => b,
@@ -494,6 +602,7 @@ async fn chat_completions(State(state): State<Arc<AppState>>, request: Request) 
     }
     // Telemetry: a valid messages array always produces stats here, so count it.
     record_and_maybe_flush(&state, &result.stats);
+    push_recent(&state, "/v1/chat/completions", &result.stats, &result.notes);
 
     let new_body = match serde_json::to_vec(&payload) {
         Ok(b) => Bytes::from(b),
@@ -510,7 +619,7 @@ async fn chat_completions(State(state): State<Arc<AppState>>, request: Request) 
         Method::POST,
         upstream_url(&state, "chat/completions"),
         Some(HeaderValue::from_static("application/json")),
-        client_auth,
+        client,
         new_body,
         stat_headers(&result.stats),
         Some(state.totals.clone()),
@@ -530,13 +639,37 @@ fn record_and_maybe_flush(state: &AppState, stats: &TokenStats) {
     }
 }
 
+/// Push one compressed request onto the dashboard's recent-requests ring
+/// (session-only, cap [`RECENT_CAP`]). `cache_hit`/`llm_used` are derived from
+/// the codec's per-message note trail (`cache_hit*` / `llm_encode*` substrings).
+/// Shared by all three compressing handlers.
+fn push_recent(state: &AppState, endpoint: &str, stats: &TokenStats, notes: &[String]) {
+    let entry = RecentEntry {
+        ts_unix: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        endpoint: endpoint.to_string(),
+        before_tokens: stats.before_tokens as u64,
+        after_tokens: stats.after_tokens as u64,
+        pct_saved: stats.pct_saved(),
+        cache_hit: notes.iter().any(|n| n.contains("cache_hit")),
+        llm_used: notes.iter().any(|n| n.contains("llm_encode")),
+    };
+    let mut ring = state.recent.lock().unwrap_or_else(|e| e.into_inner());
+    if ring.len() >= RECENT_CAP {
+        ring.pop_front();
+    }
+    ring.push_back(entry);
+}
+
 // --- Completions -------------------------------------------------------------
 
 /// `POST /v1/completions`: give a non-empty string `prompt` the user
 /// compression treatment (LLM-eligible per config), then forward verbatim.
 async fn completions(State(state): State<Arc<AppState>>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
-    let client_auth = parts.headers.get(header::AUTHORIZATION).cloned();
+    let client = client_headers(&parts.headers);
 
     let bytes = match read_body(body).await {
         Ok(b) => b,
@@ -575,6 +708,7 @@ async fn completions(State(state): State<Arc<AppState>>, request: Request) -> Re
         // Telemetry: only a non-empty string prompt produces stats (a missing
         // or non-string `prompt` is a passthrough and must not be counted).
         record_and_maybe_flush(&state, &result.stats);
+        push_recent(&state, "/v1/completions", &result.stats, &result.notes);
         extra = stat_headers(&result.stats);
     }
 
@@ -596,10 +730,88 @@ async fn completions(State(state): State<Arc<AppState>>, request: Request) -> Re
         Method::POST,
         upstream_url(&state, "completions"),
         Some(HeaderValue::from_static("application/json")),
-        client_auth,
+        client,
         new_body,
         extra,
         inspect,
+    )
+    .await
+}
+
+// --- Anthropic passthrough ---------------------------------------------------
+
+/// `POST /v1/messages`: the Anthropic messages shape (v0.3 Feature 4a). Compress
+/// `messages` with the SAME codec as chat — the shapes align: `user` string
+/// content and `{"type":"text"}` blocks get the user treatment, `tool_result`
+/// and other block types pass through untouched, and the top-level `system`
+/// field is left alone. Forward verbatim to `{base}/messages`.
+async fn messages(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    let (parts, body) = request.into_parts();
+    let client = client_headers(&parts.headers);
+
+    let bytes = match read_body(body).await {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let mut payload: Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "invalid JSON body",
+            )
+        }
+    };
+    // Move the array out (leaving an empty one behind) rather than deep-cloning;
+    // the encoded result is inserted back. The top-level `system` field and any
+    // other keys are left exactly as received.
+    let messages = match payload.get_mut("messages") {
+        Some(Value::Array(a)) if !a.is_empty() => std::mem::take(a),
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "messages required",
+            )
+        }
+    };
+
+    let result = state.codec.encode_messages(messages).await;
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("messages".to_string(), Value::Array(result.messages));
+    }
+    if state.cfg.proxy.log_stats {
+        tracing::info!(
+            before = result.stats.before_tokens,
+            after = result.stats.after_tokens,
+            pct_saved = result.stats.pct_saved(),
+            notes = ?result.notes,
+            "messages encode",
+        );
+    }
+    record_and_maybe_flush(&state, &result.stats);
+    push_recent(&state, "/v1/messages", &result.stats, &result.notes);
+
+    let new_body = match serde_json::to_vec(&payload) {
+        Ok(b) => Bytes::from(b),
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "failed to serialize request body",
+            )
+        }
+    };
+    forward(
+        &state,
+        Method::POST,
+        upstream_url(&state, "messages"),
+        Some(HeaderValue::from_static("application/json")),
+        client,
+        new_body,
+        stat_headers(&result.stats),
+        Some(state.totals.clone()),
     )
     .await
 }
@@ -613,7 +825,7 @@ async fn catch_all(State(state): State<Arc<AppState>>, request: Request) -> Resp
     let (parts, body) = request.into_parts();
     let method = parts.method;
     let content_type = parts.headers.get(header::CONTENT_TYPE).cloned();
-    let client_auth = parts.headers.get(header::AUTHORIZATION).cloned();
+    let client = client_headers(&parts.headers);
 
     let bytes = match read_body(body).await {
         Ok(b) => b,
@@ -636,7 +848,7 @@ async fn catch_all(State(state): State<Arc<AppState>>, request: Request) -> Resp
         method,
         url,
         content_type,
-        client_auth,
+        client,
         bytes,
         Vec::new(),
         None, // catch-all traffic is never inspected or counted
@@ -690,21 +902,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Response {
     };
     let local = serde_json::to_value(local).unwrap_or(Value::Null);
 
-    // Savings telemetry (v0.3 Feature 3): raw counters plus derived
-    // saved_tokens / usd_saved_est. The USD key deliberately matches the
-    // `usd_saved_est` name (and 6-decimal rounding) that stats.rs already
-    // emits in `encode --json` — one name across every JSON surface.
-    let usd = state.cfg.stats.usd_per_mtok_input;
-    let totals = json!({
-        "requests": t.requests,
-        "before_tokens": t.before_tokens,
-        "after_tokens": t.after_tokens,
-        "saved_tokens": t.saved_tokens(),
-        "usd_saved_est": round_to(t.usd_saved_est(usd), 6),
-        "upstream_cached_tokens": t.upstream_cached_tokens,
-        "responses_with_cache_info": t.responses_with_cache_info,
-        "since": t.since,
-    });
+    let totals = build_totals_json(&state, &t);
 
     let body = json!({
         "ok": true,
@@ -716,6 +914,62 @@ async fn health(State(state): State<Arc<AppState>>) -> Response {
         "cache_path": cache_path,
         "local": local,
         "totals": totals,
+    });
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+/// The savings-telemetry `totals` object shared by `/health` and
+/// `/dashboard/data` (v0.3 Feature 3). Raw counters plus derived
+/// `saved_tokens` / `usd_saved_est`. The USD key deliberately matches the
+/// `usd_saved_est` name (and 6-decimal rounding) that stats.rs emits in
+/// `encode --json` — one name across every JSON surface (pinned by test).
+fn build_totals_json(state: &AppState, t: &TotalsSnapshot) -> Value {
+    let usd = state.cfg.stats.usd_per_mtok_input;
+    json!({
+        "requests": t.requests,
+        "before_tokens": t.before_tokens,
+        "after_tokens": t.after_tokens,
+        "saved_tokens": t.saved_tokens(),
+        "usd_saved_est": round_to(t.usd_saved_est(usd), 6),
+        "upstream_cached_tokens": t.upstream_cached_tokens,
+        "responses_with_cache_info": t.responses_with_cache_info,
+        "since": t.since,
+    })
+}
+
+// --- Draft dashboard (v0.3 Feature 4c) ---------------------------------------
+
+/// `GET /dashboard`: the self-contained draft dashboard page, compiled into the
+/// binary (no build step, no external assets — works offline and under the host
+/// guard). It fetches `/health` once for the header and polls `/dashboard/data`
+/// every 2 s for the live totals and recent-requests table.
+async fn dashboard() -> Response {
+    Html(include_str!("dashboard.html")).into_response()
+}
+
+/// `GET /dashboard/data`: the dashboard's poll feed — the savings `totals`
+/// object, cache tier sizes, and the recent-requests ring (newest first).
+/// Deliberately does NOT run the local-LLM health probe (that lives on
+/// `/health`) so a 2 s poll never blocks on the model.
+async fn dashboard_data(State(state): State<Arc<AppState>>) -> Response {
+    let t = state.totals.snapshot();
+    let totals = build_totals_json(&state, &t);
+
+    state.codec.cache().sync();
+    let cache_entries = state.codec.cache().entry_count();
+    let cache_disk_entries = state.codec.cache().disk_entry_count();
+
+    // Newest first: the ring pushes newest at the back, so reverse on read.
+    let recent: Vec<RecentEntry> = {
+        let ring = state.recent.lock().unwrap_or_else(|e| e.into_inner());
+        ring.iter().rev().cloned().collect()
+    };
+
+    let body = json!({
+        "totals": totals,
+        "cache_entries": cache_entries,
+        "cache_disk_entries": cache_disk_entries,
+        "recent": recent,
     });
     (StatusCode::OK, Json(body)).into_response()
 }

@@ -90,8 +90,15 @@ proxy:
   upstream_base_url: "https://api.x.ai/v1"    # default: https://api.x.ai/v1
   # Env var name holding the upstream API key. Never hardcode secrets here.
   upstream_api_key_env: "X_API_KEY"           # default: X_API_KEY
-  # Forward the client's own Authorization header upstream when present,
-  # falling back to the env-var key above when it isn't.
+  # How to authenticate to the upstream (v0.3):
+  #   bearer     - Authorization: Bearer <key>  (OpenAI / xAI; default)
+  #   x_api_key  - x-api-key: <key> + an anthropic-version header
+  #                (Anthropic-format upstreams, e.g. Z.ai's GLM endpoint —
+  #                 see config.glm.yaml)
+  upstream_auth_style: "bearer"               # default: bearer
+  # Forward the client's own auth header upstream when present (Authorization in
+  # bearer style, x-api-key in x_api_key style), falling back to the env-var key
+  # above when it isn't.
   pass_client_auth: true                      # default: true
   # Reject requests with no Authorization header at all (401) before they
   # ever reach the codec or upstream. Off by default since this proxy is

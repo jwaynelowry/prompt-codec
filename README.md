@@ -109,6 +109,40 @@ doesn't grow. Totals are flushed on every `/health` read, every 32 counted
 requests, and at graceful (ctrl-c) shutdown; a hard kill may lose the last few
 requests' counting.
 
+### GLM demo + dashboard (draft, new in v0.3)
+
+The proxy can also front an **Anthropic-format** upstream: `POST /v1/messages`
+compresses the `messages` array in place (string content and `{"type":"text"}`
+blocks get the user treatment; `tool_result` and other block types pass through
+untouched; the top-level `system` field is left alone) and forwards verbatim,
+exactly like the OpenAI routes. Pair it with `proxy.upstream_auth_style:
+x_api_key` for `x-api-key` + `anthropic-version` auth.
+
+`config.glm.yaml` wires this to Z.ai's GLM 5.2 endpoint on port **8788** (so it
+runs alongside the xAI proxy on 8787). Launch it with:
+
+```bash
+export Z_AI_API_KEY=...            # or let the script load it (see below)
+./target/release/prompt-codec proxy --config config.glm.yaml
+# → dashboard at http://127.0.0.1:8788/dashboard
+```
+
+`scripts/run_glm_demo.sh` loads `Z_AI_API_KEY` from `~/.claude/settings.local.json`
+(the `env` object) into the child process **without echoing the value**, builds
+the release binary if needed, and execs the proxy:
+
+```bash
+scripts/run_glm_demo.sh
+```
+
+**Dashboard** (`GET /dashboard`, draft UI — functional over pretty): a single
+self-contained page (no external assets, works offline under the host guard).
+It shows the lifetime totals cards (requests, tokens saved, est. $ saved,
+upstream cached tokens), a recent-requests table (last 20, session-only), and a
+**test-drive** box — type a prompt, it's compressed, sent to GLM 5.2 via
+`/v1/messages`, and the reply plus the `x-prompt-codec-*` savings headers are
+shown. The page polls `GET /dashboard/data` (totals + recent ring) every 2 s.
+
 ### Hermes wiring
 
 In `~/.hermes/config.yaml` (or a custom provider), add a provider that hits the proxy:
@@ -195,7 +229,8 @@ See `config.yaml` (your live config) / `config.example.yaml` (fully commented v2
 | `proxy.host` / `proxy.port` | `127.0.0.1` / `8787` | |
 | `proxy.upstream_base_url` | `https://api.x.ai/v1` | your paid provider |
 | `proxy.upstream_api_key_env` | `X_API_KEY` | env var holding the key — never hardcode it |
-| `proxy.pass_client_auth` | `true` | forward client's own Authorization upstream |
+| `proxy.upstream_auth_style` **(new in v0.3)** | `bearer` | `bearer` (`Authorization: Bearer`, OpenAI/xAI) \| `x_api_key` (`x-api-key` + `anthropic-version`, for Anthropic-format upstreams like Z.ai's GLM endpoint — see `config.glm.yaml`) |
+| `proxy.pass_client_auth` | `true` | forward client's own auth header upstream (Authorization in `bearer`, x-api-key in `x_api_key`) |
 | `proxy.require_client_auth` **(new)** | `false` | 401 any request with no Authorization at all |
 | `proxy.log_stats` | `true` | log before/after tokens + notes to stderr |
 | `stats.usd_per_mtok_input` | `3.0` | rough $ savings display only |

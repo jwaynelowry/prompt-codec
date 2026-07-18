@@ -790,3 +790,164 @@ async fn totals_flush_at_32_request_boundary() {
         "below the 32-request boundary nothing is flushed"
     );
 }
+
+// --- Task 3b: Anthropic passthrough + draft dashboard -----------------------
+
+#[tokio::test]
+async fn anthropic_messages_compressed_and_forwarded() {
+    // An Anthropic-shaped upstream reply (content[0].text + a cache-read usage).
+    const RESP: &str = r#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"PONG"}],"usage":{"input_tokens":10,"cache_read_input_tokens":5,"output_tokens":2}}"#;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_string(RESP),
+        )
+        .mount(&server)
+        .await;
+
+    // x_api_key auth style + a unique env var (process-global; parallel tests).
+    let env_name = "PROMPT_CODEC_TEST_ZAI_KEY_MESSAGES";
+    std::env::set_var(env_name, "glm-secret-key");
+    let mut cfg = rules_cfg(&format!("{}/v1", server.uri()));
+    cfg.proxy.upstream_auth_style = "x_api_key".into();
+    cfg.proxy.upstream_api_key_env = env_name.to_string();
+    let proxy = spawn_proxy(cfg).await;
+
+    // The tool_result block must survive byte-identical (never traversed).
+    let tool_result = serde_json::json!({
+        "type": "tool_result",
+        "tool_use_id": "t1",
+        "content": "data"
+    });
+    let client = Client::new();
+    let r = client
+        .post(format!("{proxy}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "glm-5.2",
+            "max_tokens": 64,
+            "system": "keep me",
+            "messages": [
+                {"role": "user", "content": FLUFFY},
+                {"role": "assistant", "content": "Sure, I can help with that."},
+                {"role": "user", "content": [
+                    tool_result,
+                    {"type": "text", "text": FLUFFY}
+                ]}
+            ],
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // Client sees the upstream body verbatim + our stat headers.
+    assert_eq!(r.status().as_u16(), 200);
+    assert!(r.headers().contains_key("x-prompt-codec-before"));
+    assert!(r.headers().contains_key("x-prompt-codec-after"));
+    assert!(r.headers().contains_key("x-prompt-codec-saved-pct"));
+    assert_eq!(
+        r.text().await.unwrap(),
+        RESP,
+        "upstream body byte-identical"
+    );
+
+    // Upstream saw compressed text, an untouched tool_result + system, and the
+    // Anthropic-style auth/version headers.
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let req = &requests[0];
+    assert_eq!(
+        req.headers.get("x-api-key").unwrap().to_str().unwrap(),
+        "glm-secret-key",
+        "env key sent as x-api-key"
+    );
+    assert!(
+        req.headers.contains_key("anthropic-version"),
+        "anthropic-version header forwarded"
+    );
+
+    let sent: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+    let m0 = sent["messages"][0]["content"].as_str().unwrap();
+    assert!(!m0.contains("Thank you"), "string user content compressed");
+    assert!(m0.contains("src/auth.rs"), "real content preserved");
+
+    // tool_result block: deep-equal to the original (byte-identical structure).
+    assert_eq!(
+        sent["messages"][2]["content"][0], tool_result,
+        "tool_result block passed through untouched"
+    );
+    let text_block = sent["messages"][2]["content"][1]["text"].as_str().unwrap();
+    assert!(
+        !text_block.contains("Thank you"),
+        "text content block compressed"
+    );
+    assert!(text_block.contains("src/auth.rs"), "real content preserved");
+
+    // Top-level `system` is left exactly as sent.
+    assert_eq!(sent["system"], "keep me", "system field untouched");
+}
+
+#[tokio::test]
+async fn dashboard_serves_html_and_data() {
+    const RESP: &str = r#"{"choices":[{"message":{"role":"assistant","content":"done"}}]}"#;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(RESP))
+        .mount(&server)
+        .await;
+
+    let proxy = spawn_proxy(rules_cfg(&format!("{}/v1", server.uri()))).await;
+    let client = Client::new();
+
+    // The page is self-contained HTML naming the product.
+    let page = client
+        .get(format!("{proxy}/dashboard"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status().as_u16(), 200);
+    assert!(
+        page.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("text/html"),
+        "dashboard is served as HTML"
+    );
+    assert!(page.text().await.unwrap().contains("prompt-codec"));
+
+    // One compressed request, then the poll feed reflects it.
+    let r = client
+        .post(format!("{proxy}/v1/chat/completions"))
+        .json(&serde_json::json!({"messages": [{"role": "user", "content": FLUFFY}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let _ = r.text().await.unwrap();
+
+    let data: serde_json::Value = client
+        .get(format!("{proxy}/dashboard/data"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(data["totals"]["requests"], 1);
+    assert!(data["totals"]["usd_saved_est"].is_number());
+    let recent = data["recent"].as_array().unwrap();
+    assert_eq!(recent.len(), 1, "one recent request recorded");
+    assert_eq!(recent[0]["endpoint"], "/v1/chat/completions");
+    assert!(recent[0]["before_tokens"].as_u64().unwrap() > 0);
+    assert!(recent[0]["after_tokens"].as_u64().unwrap() > 0);
+    assert!(
+        recent[0]["before_tokens"].as_u64().unwrap() > recent[0]["after_tokens"].as_u64().unwrap(),
+        "rules compression saved tokens"
+    );
+}

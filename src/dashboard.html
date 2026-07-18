@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>prompt-codec dashboard</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 1.5rem;
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    max-width: 960px; margin: 0 auto;
+  }
+  h1 { font-size: 1.4rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1rem; margin: 1.5rem 0 .5rem; }
+  .sub { opacity: .7; font-size: .85rem; margin-bottom: 1rem; }
+  .sub code { background: rgba(128,128,128,.18); padding: .05rem .3rem; border-radius: 3px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: .75rem; }
+  .card {
+    border: 1px solid rgba(128,128,128,.3); border-radius: 8px; padding: .75rem 1rem;
+  }
+  .card .n { font-size: 1.5rem; font-weight: 600; }
+  .card .l { opacity: .7; font-size: .8rem; text-transform: uppercase; letter-spacing: .03em; }
+  table { border-collapse: collapse; width: 100%; font-size: .85rem; }
+  th, td { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid rgba(128,128,128,.2); }
+  th { opacity: .7; font-weight: 600; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .yes { color: #2e9e44; font-weight: 600; }
+  .no { opacity: .35; }
+  textarea, input[type=number] {
+    font: inherit; padding: .5rem; border: 1px solid rgba(128,128,128,.4);
+    border-radius: 6px; background: transparent; color: inherit;
+  }
+  textarea { width: 100%; min-height: 90px; resize: vertical; }
+  .row { display: flex; gap: .75rem; align-items: center; margin: .5rem 0; flex-wrap: wrap; }
+  button {
+    font: inherit; font-weight: 600; padding: .5rem 1.1rem; border: 0; border-radius: 6px;
+    background: #2563eb; color: #fff; cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+  pre {
+    background: rgba(128,128,128,.12); padding: .75rem; border-radius: 6px;
+    white-space: pre-wrap; word-break: break-word; margin: .5rem 0 0; min-height: 1.5rem;
+  }
+  .stats { font-size: .85rem; opacity: .8; margin-top: .4rem; font-variant-numeric: tabular-nums; }
+  .empty { opacity: .5; font-style: italic; }
+</style>
+</head>
+<body>
+  <h1>prompt-codec &mdash; live dashboard</h1>
+  <div class="sub">
+    config: <code id="cfg-source">…</code> &nbsp;&rarr;&nbsp; upstream: <code id="cfg-upstream">…</code>
+    <span id="cfg-mode"></span>
+    <span style="float:right">draft UI</span>
+  </div>
+
+  <h2>Totals (lifetime)</h2>
+  <div class="cards">
+    <div class="card"><div class="n" id="t-requests">–</div><div class="l">Requests</div></div>
+    <div class="card"><div class="n" id="t-saved">–</div><div class="l">Tokens saved</div></div>
+    <div class="card"><div class="n" id="t-usd">–</div><div class="l">Est. $ saved</div></div>
+    <div class="card"><div class="n" id="t-cached">–</div><div class="l">Upstream cached tok</div></div>
+  </div>
+
+  <h2>Recent requests</h2>
+  <table>
+    <thead>
+      <tr><th>time</th><th>endpoint</th><th class="num">before</th><th class="num">after</th><th class="num">saved %</th><th>cache</th><th>llm</th></tr>
+    </thead>
+    <tbody id="recent"><tr><td colspan="7" class="empty">no requests yet</td></tr></tbody>
+  </table>
+
+  <h2>Test drive (compress &rarr; GLM 5.2 &rarr; reply)</h2>
+  <textarea id="td-input" placeholder="Type a prompt. It is compressed by the codec, forwarded to GLM 5.2 via /v1/messages, and the reply plus savings headers are shown below."></textarea>
+  <div class="row">
+    <label>max_tokens <input type="number" id="td-max" value="256" min="1" style="width:6rem"></label>
+    <button id="td-send" onclick="send()">Send</button>
+    <span class="stats" id="td-stats"></span>
+  </div>
+  <pre id="td-out"></pre>
+
+<script>
+function fmt(n) {
+  if (n === null || n === undefined) return "–";
+  return Number(n).toLocaleString();
+}
+function fmtTime(sec) {
+  if (!sec) return "";
+  return new Date(sec * 1000).toLocaleTimeString();
+}
+
+async function loadHeader() {
+  try {
+    const r = await fetch("/health");
+    const d = await r.json();
+    document.getElementById("cfg-source").textContent = d.config_source || "?";
+    document.getElementById("cfg-upstream").textContent = d.upstream || "?";
+    if (d.encoder_mode) {
+      document.getElementById("cfg-mode").textContent = " (mode: " + d.encoder_mode + ")";
+    }
+  } catch (e) { /* header is best-effort */ }
+}
+
+async function poll() {
+  try {
+    const r = await fetch("/dashboard/data");
+    const d = await r.json();
+    const t = d.totals || {};
+    document.getElementById("t-requests").textContent = fmt(t.requests);
+    document.getElementById("t-saved").textContent = fmt(t.saved_tokens);
+    document.getElementById("t-usd").textContent = "$" + (t.usd_saved_est || 0).toFixed(4);
+    document.getElementById("t-cached").textContent = fmt(t.upstream_cached_tokens);
+
+    const tbody = document.getElementById("recent");
+    const rows = d.recent || [];
+    if (rows.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="7" class="empty">no requests yet</td></tr>';
+    } else {
+      tbody.innerHTML = rows.map(function (x) {
+        return "<tr>" +
+          "<td>" + fmtTime(x.ts_unix) + "</td>" +
+          "<td>" + x.endpoint + "</td>" +
+          '<td class="num">' + fmt(x.before_tokens) + "</td>" +
+          '<td class="num">' + fmt(x.after_tokens) + "</td>" +
+          '<td class="num">' + (x.pct_saved || 0).toFixed(1) + "</td>" +
+          '<td class="' + (x.cache_hit ? "yes" : "no") + '">' + (x.cache_hit ? "hit" : "—") + "</td>" +
+          '<td class="' + (x.llm_used ? "yes" : "no") + '">' + (x.llm_used ? "yes" : "—") + "</td>" +
+          "</tr>";
+      }).join("");
+    }
+  } catch (e) { /* transient poll failure — keep the last view */ }
+}
+
+async function send() {
+  const btn = document.getElementById("td-send");
+  const text = document.getElementById("td-input").value;
+  const maxTokens = parseInt(document.getElementById("td-max").value, 10) || 256;
+  const out = document.getElementById("td-out");
+  const stats = document.getElementById("td-stats");
+  if (!text.trim()) { out.textContent = "(enter a prompt first)"; return; }
+  btn.disabled = true;
+  out.textContent = "sending…";
+  stats.textContent = "";
+  try {
+    const resp = await fetch("/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "glm-5.2",
+        max_tokens: maxTokens,
+        messages: [{ role: "user", content: text }]
+      })
+    });
+    const before = resp.headers.get("x-prompt-codec-before");
+    const after = resp.headers.get("x-prompt-codec-after");
+    const pct = resp.headers.get("x-prompt-codec-saved-pct");
+    if (before !== null) {
+      stats.textContent = "compressed " + before + " → " + after + " tokens (" + pct + "% saved)";
+    }
+    const data = await resp.json();
+    let reply;
+    if (data && Array.isArray(data.content) && data.content[0] && data.content[0].text) {
+      reply = data.content[0].text;
+    } else {
+      reply = JSON.stringify(data, null, 2);
+    }
+    out.textContent = reply;
+  } catch (e) {
+    out.textContent = "error: " + e;
+  } finally {
+    btn.disabled = false;
+    poll();
+  }
+}
+
+loadHeader();
+poll();
+setInterval(poll, 2000);
+</script>
+</body>
+</html>

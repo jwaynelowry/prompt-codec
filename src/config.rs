@@ -115,6 +115,11 @@ pub struct ProxyConfig {
     pub pass_client_auth: bool,
     pub require_client_auth: bool,
     pub log_stats: bool,
+    /// How to authenticate to the upstream (v0.3 Feature 4):
+    /// - `"bearer"` (default): `Authorization: Bearer <key>` (OpenAI/xAI).
+    /// - `"x_api_key"`: `x-api-key: <key>` plus a forwarded `anthropic-version`
+    ///   header (Anthropic-format upstreams, e.g. Z.ai's GLM endpoint).
+    pub upstream_auth_style: String,
 }
 
 impl Default for ProxyConfig {
@@ -127,6 +132,7 @@ impl Default for ProxyConfig {
             pass_client_auth: true,
             require_client_auth: false,
             log_stats: true,
+            upstream_auth_style: "bearer".to_string(),
         }
     }
 }
@@ -207,6 +213,7 @@ const KNOWN_SECTIONS: &[(&str, &[&str])] = &[
             "require_client_auth",
             "log_stats",
             "port",
+            "upstream_auth_style",
         ],
     ),
     ("stats", &["usd_per_mtok_input"]),
