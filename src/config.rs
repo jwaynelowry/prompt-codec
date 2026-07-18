@@ -36,7 +36,7 @@ impl Default for LocalConfig {
         Self {
             base_url: "http://127.0.0.1:11434/v1".to_string(),
             api_key: "ollama".to_string(),
-            model: "gemma4:12b-mlx".to_string(),
+            model: "qwen3.5:4b-mlx".to_string(),
             temperature: 0.1,
             max_tokens: 2048,
             reasoning_effort: "none".to_string(),
@@ -335,7 +335,7 @@ mod tests {
     #[test]
     fn defaults_are_sane() {
         let c = AppConfig::default();
-        assert_eq!(c.local.model, "gemma4:12b-mlx");
+        assert_eq!(c.local.model, "qwen3.5:4b-mlx");
         assert_eq!(c.encoder.llm_timeout_s, 15.0);
         assert_eq!(c.encoder.llm_scope, LlmScope::LastUser);
         assert_eq!(c.proxy.port, 8787);
