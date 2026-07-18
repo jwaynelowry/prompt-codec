@@ -98,6 +98,11 @@ impl DiskTier {
     /// returns `None` — construction of the owning `RewriteCache` still
     /// succeeds, degraded to memory-only.
     fn open(cfg: DiskCacheConfig) -> Option<Self> {
+        // Migration breadcrumb: SCHEMA_SQL is v1 (meta.schema_version = '1').
+        // Any future schema change must read meta.schema_version HERE and
+        // branch (ALTER/backfill, then bump the row) before assuming the
+        // current shape — the CREATE IF NOT EXISTS statements alone won't
+        // upgrade an existing v1 database.
         if let Some(parent) = cfg.path.parent() {
             if !parent.as_os_str().is_empty() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
@@ -134,7 +139,9 @@ impl DiskTier {
 
     fn warn_once(&self, op: &str, err: &dyn std::fmt::Display) {
         if !self.warned.swap(true, Ordering::Relaxed) {
-            tracing::warn!(operation = op, error = %err, "rewrite cache disk error; degrading to memory-only");
+            // Per-operation posture: only the FAILED call falls back to the
+            // memory tier — the disk tier stays attached and later calls retry.
+            tracing::warn!(operation = op, error = %err, "rewrite cache disk operation failed; serving from memory for this operation");
         }
     }
 
@@ -158,6 +165,9 @@ impl DiskTier {
         };
         if found.is_some() {
             // Best-effort recency touch; a failure here is deliberately ignored.
+            // Note: once a hit is promoted into the memory tier, later reads are
+            // served by moka and never reach this touch — a hot entry's disk
+            // recency can look stale. Accepted at the 100k default cap.
             let _ = conn.execute(
                 "UPDATE rewrites SET last_used = ?1 WHERE key = ?2",
                 params![now_unix(), key],
@@ -226,11 +236,21 @@ impl DiskTier {
 
     fn meta_get(&self, k: &str) -> Option<String> {
         let conn = self.lock();
-        conn.query_row("SELECT v FROM meta WHERE k = ?1", params![k], |r| {
-            r.get::<_, String>(0)
-        })
-        .optional()
-        .unwrap_or(None)
+        match conn
+            .query_row("SELECT v FROM meta WHERE k = ?1", params![k], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()
+        {
+            Ok(v) => v,
+            Err(e) => {
+                // Best-effort posture: a missing row is a plain None (mapped by
+                // `.optional()`), but a REAL SQL error is warned, not swallowed
+                // — callers still just see None and carry on.
+                self.warn_once("meta_get", &e);
+                None
+            }
+        }
     }
 
     fn meta_set(&self, k: &str, v: &str) {
@@ -416,6 +436,76 @@ mod tests {
         let b = RewriteCache::new_with_disk(16, Some(cfg));
         assert_eq!(b.get(&k).as_deref(), Some("compressed value here"));
         assert_eq!(b.disk_entry_count(), Some(1));
+    }
+
+    #[test]
+    fn disk_hit_promotes_into_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = disk_cfg(dir.path(), 100_000);
+        let k = RewriteCache::key("promote", 0.45, "m");
+        {
+            let a = RewriteCache::new_with_disk(16, Some(cfg.clone()));
+            a.put(k.clone(), "promoted value".into());
+        } // drop A: only the disk row remains
+        let b = RewriteCache::new_with_disk(16, Some(cfg));
+        b.sync();
+        assert_eq!(
+            b.entry_count(),
+            0,
+            "a fresh instance starts with an empty memory tier"
+        );
+        assert_eq!(b.get(&k).as_deref(), Some("promoted value")); // disk-served
+        b.sync();
+        assert_eq!(
+            b.entry_count(),
+            1,
+            "a disk-served get must promote the value into the memory tier"
+        );
+    }
+
+    #[test]
+    fn read_touch_refreshes_disk_recency_for_prune() {
+        // Eviction is LRU by USE, not insert order: a disk-served `get`
+        // touches `last_used`, so a read row outlives an unread-but-newer row.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = disk_cfg(dir.path(), 1); // cap 1: prune keeps exactly one row
+        let ka = RewriteCache::key("a", 0.45, "m");
+        let kb = RewriteCache::key("b", 0.45, "m");
+        {
+            let c = RewriteCache::new_with_disk(16, Some(cfg.clone()));
+            c.put(ka.clone(), "value for a".into());
+            c.put(kb.clone(), "value for b".into());
+        }
+        // `last_used` has unix-SECOND resolution: same-second puts + get would
+        // all tie and fall to the rowid tie-break, hiding the touch. Backdate
+        // both rows (A older than B) so the read-touch is the only thing that
+        // can save A.
+        {
+            let conn = Connection::open(&cfg.path).unwrap();
+            conn.execute(
+                "UPDATE rewrites SET last_used = 100 WHERE key = ?1",
+                params![ka],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE rewrites SET last_used = 200 WHERE key = ?1",
+                params![kb],
+            )
+            .unwrap();
+        }
+        let c = RewriteCache::new_with_disk(16, Some(cfg.clone()));
+        assert_eq!(c.get(&ka).as_deref(), Some("value for a")); // disk hit touches A
+        c.prune_now(); // cap 1: evicts the LRU row — B, despite its newer insert
+        let fresh = RewriteCache::new_with_disk(16, Some(cfg));
+        assert_eq!(fresh.disk_entry_count(), Some(1));
+        assert!(
+            fresh.get(&ka).is_some(),
+            "the read-touched row must survive the prune"
+        );
+        assert!(
+            fresh.get(&kb).is_none(),
+            "the unread row must be evicted even though it was inserted later"
+        );
     }
 
     #[test]
