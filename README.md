@@ -91,7 +91,7 @@ when `cache.persist: false`):
   "before_tokens": 5678901,
   "after_tokens": 3456789,
   "saved_tokens": 2222112,        // derived: before − after (clamped at 0)
-  "est_usd_saved": 6.666336,      // saved / 1e6 × stats.usd_per_mtok_input
+  "usd_saved_est": 6.666336,      // saved / 1e6 × stats.usd_per_mtok_input (same key as encode --json)
   "upstream_cached_tokens": 890123,
   "responses_with_cache_info": 1100,
   "since": "2026-07-18T17:00:00Z" // when the totals row was first created

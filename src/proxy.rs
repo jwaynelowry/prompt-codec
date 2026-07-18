@@ -31,8 +31,8 @@ use serde_json::{json, Value};
 use crate::codec::Codec;
 use crate::config::{AppConfig, ProxyConfig};
 use crate::llm::LlmHealth;
-use crate::stats::TokenStats;
-use crate::telemetry::{extract_cached_tokens, TailBuffer, Totals};
+use crate::stats::{round_to, TokenStats};
+use crate::telemetry::{extract_cached_tokens, TailBuffer, Totals, TotalsSnapshot};
 
 /// Shared proxy state, built once in [`create_app`] and reused for the process
 /// lifetime behind an `Arc`.
@@ -59,7 +59,14 @@ pub struct AppState {
 /// to call. Serialization failure is swallowed — telemetry never fails a
 /// request or shutdown.
 pub fn flush_totals(state: &AppState) {
-    if let Ok(json) = serde_json::to_string(&state.totals.snapshot()) {
+    flush_snapshot(state, &state.totals.snapshot());
+}
+
+/// Persist an already-taken snapshot — callers that also *report* the totals
+/// (`/health`) take one snapshot and use it for both, rather than reading the
+/// atomics twice.
+fn flush_snapshot(state: &AppState, snap: &TotalsSnapshot) {
+    if let Ok(json) = serde_json::to_string(snap) {
         state.codec.cache().meta_set("totals_json", &json);
     }
 }
@@ -654,10 +661,14 @@ struct LocalHealth {
 
 /// `GET /health`: encoder/upstream/config provenance, live cache size, savings
 /// totals, and a non-blocking local-LLM reachability probe. Never fails.
+///
+/// Side-effecting by design: every read also flushes the totals snapshot to
+/// the cache `meta` table — flush trigger (a) of three — so reading health is
+/// what guarantees the restart path carries the latest counters.
 async fn health(State(state): State<Arc<AppState>>) -> Response {
-    // Persist the current totals so a subsequent restart carries them over
-    // (the primary flush trigger the restart path relies on).
-    flush_totals(&state);
+    // ONE snapshot serves both the flush and the report below.
+    let t = state.totals.snapshot();
+    flush_snapshot(&state, &t);
 
     // Flush moka's pending write accounting so the count is accurate.
     state.codec.cache().sync();
@@ -680,15 +691,16 @@ async fn health(State(state): State<Arc<AppState>>) -> Response {
     let local = serde_json::to_value(local).unwrap_or(Value::Null);
 
     // Savings telemetry (v0.3 Feature 3): raw counters plus derived
-    // saved_tokens / est_usd_saved.
-    let t = state.totals.snapshot();
+    // saved_tokens / usd_saved_est. The USD key deliberately matches the
+    // `usd_saved_est` name (and 6-decimal rounding) that stats.rs already
+    // emits in `encode --json` — one name across every JSON surface.
     let usd = state.cfg.stats.usd_per_mtok_input;
     let totals = json!({
         "requests": t.requests,
         "before_tokens": t.before_tokens,
         "after_tokens": t.after_tokens,
         "saved_tokens": t.saved_tokens(),
-        "est_usd_saved": round6(t.est_usd_saved(usd)),
+        "usd_saved_est": round_to(t.usd_saved_est(usd), 6),
         "upstream_cached_tokens": t.upstream_cached_tokens,
         "responses_with_cache_info": t.responses_with_cache_info,
         "since": t.since,
@@ -706,12 +718,6 @@ async fn health(State(state): State<Arc<AppState>>) -> Response {
         "totals": totals,
     });
     (StatusCode::OK, Json(body)).into_response()
-}
-
-/// Round to 6 decimal places — matches the `usd_saved_est` precision used
-/// elsewhere (stats.rs), keeping tiny demo-scale savings visible.
-fn round6(x: f64) -> f64 {
-    (x * 1_000_000.0).round() / 1_000_000.0
 }
 
 #[cfg(test)]

@@ -136,7 +136,8 @@ impl TotalsSnapshot {
     }
 
     /// Derived estimated USD saved: `saved_tokens / 1e6 × usd_per_mtok_input`.
-    pub fn est_usd_saved(&self, usd_per_mtok_input: f64) -> f64 {
+    /// Named to match the `usd_saved_est` JSON key shared with stats.rs.
+    pub fn usd_saved_est(&self, usd_per_mtok_input: f64) -> f64 {
         self.saved_tokens() as f64 / 1_000_000.0 * usd_per_mtok_input
     }
 }
@@ -347,7 +348,7 @@ mod tests {
         assert_eq!(s.upstream_cached_tokens, 80);
         assert_eq!(s.responses_with_cache_info, 2);
         assert_eq!(s.since, "2026-07-18T17:00:00Z");
-        assert!((s.est_usd_saved(3.0) - 0.0018).abs() < 1e-12);
+        assert!((s.usd_saved_est(3.0) - 0.0018).abs() < 1e-12);
     }
 
     #[test]

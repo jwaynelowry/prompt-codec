@@ -56,7 +56,9 @@ impl Serialize for TokenStats {
     }
 }
 
-fn round_to(x: f64, places: i32) -> f64 {
+/// Round to `places` decimals. `pub(crate)` so the proxy's `/health` totals
+/// use the same rounding (and 6-decimal USD precision) as `encode --json`.
+pub(crate) fn round_to(x: f64, places: i32) -> f64 {
     let factor = 10f64.powi(places);
     (x * factor).round() / factor
 }

@@ -661,6 +661,12 @@ async fn health_totals_accumulate() {
     );
     assert_eq!(t["responses_with_cache_info"], 2);
     assert!(t["since"].as_str().unwrap().ends_with('Z'), "RFC3339 since");
+    // Field-name pin: the USD key matches stats.rs' `usd_saved_est` (one name
+    // across every JSON surface — encode --json and /health totals).
+    assert!(
+        t["usd_saved_est"].as_f64().unwrap() > 0.0,
+        "usd_saved_est present under the standardized name"
+    );
 }
 
 #[tokio::test]
@@ -718,5 +724,69 @@ async fn totals_survive_restart() {
     assert_eq!(
         health_b["totals"]["since"], health_a["totals"]["since"],
         "since is preserved across restart, not reset"
+    );
+}
+
+/// Drive `n` compressed chat requests through a persist=true proxy on a fresh
+/// tempdir — deliberately NEVER reading /health on it (that would flush) — then
+/// spawn a second proxy on the same path and report the request count its
+/// totals carried over. Isolates the every-32-requests flush trigger.
+async fn requests_carried_after_restart(upstream_base: &str, n: usize) -> u64 {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = rules_cfg(upstream_base);
+    cfg.cache.persist = true;
+    cfg.cache.path = Some(dir.path().join("rewrites.sqlite3"));
+
+    let proxy_a = spawn_proxy(cfg.clone()).await;
+    let client = Client::new();
+    for _ in 0..n {
+        let r = client
+            .post(format!("{proxy_a}/v1/chat/completions"))
+            .json(&serde_json::json!({"messages": [{"role": "user", "content": FLUFFY}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        let _ = r.text().await.unwrap();
+    }
+
+    // Restart onto the same DB: whatever was flushed is what carries over.
+    let proxy_b = spawn_proxy(cfg).await;
+    let health: serde_json::Value = client
+        .get(format!("{proxy_b}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    health["totals"]["requests"].as_u64().unwrap()
+}
+
+#[tokio::test]
+async fn totals_flush_at_32_request_boundary() {
+    const RESP: &str = r#"{"choices":[{"message":{"role":"assistant","content":"done"}}]}"#;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(RESP))
+        .mount(&server)
+        .await;
+    let base = format!("{}/v1", server.uri());
+
+    // Exactly 32 counted requests: the every-32nd-request flush fires, so the
+    // count survives a restart WITHOUT any /health read having happened.
+    assert_eq!(
+        requests_carried_after_restart(&base, 32).await,
+        32,
+        "the 32nd counted request must flush totals to disk"
+    );
+
+    // Negative control: 31 requests never cross the boundary (and /health was
+    // never read), so nothing was flushed — the restarted proxy starts fresh.
+    assert_eq!(
+        requests_carried_after_restart(&base, 31).await,
+        0,
+        "below the 32-request boundary nothing is flushed"
     );
 }
