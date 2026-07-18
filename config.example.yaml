@@ -1,0 +1,78 @@
+# Prompt Codec — v2 (Rust) config reference.
+# Copy to config.yaml and edit. Every key below is optional; anything you
+# omit falls back to the built-in default shown in its comment. Unknown or
+# v1-only keys are ignored with a `warning:` line on stderr, never a hard
+# error — see the README's config table for the full superseded-key list.
+
+local:
+  # OpenAI-compatible base URL for your free local model.
+  # Examples:
+  #   Ollama:  http://127.0.0.1:11434/v1
+  #   MLX-LM:  http://127.0.0.1:8080/v1
+  #   Exo:     http://127.0.0.1:52415/v1
+  base_url: "http://127.0.0.1:11434/v1"      # default: http://127.0.0.1:11434/v1
+  api_key: "ollama"                          # default: ollama (most local servers ignore this)
+  model: "gemma3:4b"                         # default: gemma3:4b — match `ollama list` / your MLX tag
+  temperature: 0.1                           # default: 0.1
+  max_tokens: 2048                           # default: 2048 (ceiling; actual budget is sized per call)
+
+encoder:
+  # rules  = free deterministic compression only, no model needed
+  # local  = rewrite via the local LLM only
+  # hybrid = rules first, then local LLM refine (best savings; recommended)
+  mode: hybrid                               # default: hybrid
+
+  # Target ratio of original token count the local LLM rewrite aims for.
+  # 0.45 = aim for ~45% of input tokens. Only affects `local`/`hybrid`.
+  target_ratio: 0.45                         # default: 0.45
+
+  # Never touch system messages shorter than this many chars.
+  protect_system_under_chars: 800            # default: 800
+
+  # Skip compression entirely for user/system content shorter than this.
+  min_chars_to_compress: 400                 # default: 400
+
+  # Deterministic pipeline: fence-safe boilerplate stripping, line dedupe,
+  # whitespace collapse. Runs in `rules` and `hybrid` modes when true.
+  rules_enabled: true                        # default: true
+
+  # Which messages are eligible to CALL the local model on a cache miss
+  # (a cache HIT always applies regardless of scope, which is what keeps
+  # resent history byte-stable across turns and upstream prompt caches warm):
+  #   last_user - only the most recent user message may call the model
+  #   all       - every eligible user/system message may call the model
+  #   none      - never call the model, even in local/hybrid mode (rules only)
+  llm_scope: last_user                       # default: last_user
+
+  # Hard per-call timeout for the local model, in seconds.
+  llm_timeout_s: 15                          # default: 15
+
+  # Reserved for future long-bullet-list trimming; currently a no-op switch.
+  list_trim_enabled: false                   # default: false
+
+cache:
+  # Max accepted-rewrite cache entries (LRU eviction beyond this bound).
+  # Keyed on sha256(model|target_ratio|content), shared by the CLI and proxy.
+  max_entries: 4096                          # default: 4096
+
+proxy:
+  host: "127.0.0.1"                          # default: 127.0.0.1
+  port: 8787                                  # default: 8787
+  # Where compressed requests are forwarded (your paid API).
+  upstream_base_url: "https://api.x.ai/v1"    # default: https://api.x.ai/v1
+  # Env var name holding the upstream API key. Never hardcode secrets here.
+  upstream_api_key_env: "X_API_KEY"           # default: X_API_KEY
+  # Forward the client's own Authorization header upstream when present,
+  # falling back to the env-var key above when it isn't.
+  pass_client_auth: true                      # default: true
+  # Reject requests with no Authorization header at all (401) before they
+  # ever reach the codec or upstream. Off by default since this proxy is
+  # meant to run on loopback for a single local user.
+  require_client_auth: false                  # default: false
+  # Log before/after token counts and notes per request (to stderr).
+  log_stats: true                             # default: true
+
+stats:
+  # Rough $ per 1M input tokens, used only to print an estimated savings
+  # figure — not tied to any real billing API.
+  usd_per_mtok_input: 3.0                     # default: 3.0

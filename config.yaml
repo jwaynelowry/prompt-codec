@@ -1,11 +1,12 @@
-# Prompt Codec — local config
-# Local model encodes/decodes; paid API only sees compressed prompts.
+# Prompt Codec — local config (v2 / Rust)
+# Local model encodes; paid API only sees compressed prompts.
 
 local:
   base_url: "http://127.0.0.1:11434/v1"
   api_key: "ollama"
-  model: "gemma4:12b-mlx"
-  timeout_s: 120
+  # gemma4:12b-mlx isn't a real tag on this box — pinned to what `ollama list`
+  # actually has. Swap for your own local/MLX/Exo model tag.
+  model: "gemma3:4b"
   temperature: 0.1
   max_tokens: 2048
 
@@ -16,11 +17,12 @@ encoder:
   protect_system_under_chars: 800
   min_chars_to_compress: 400
   rules_enabled: true
-  roles: ["user", "system", "tool"]
-
-decoder:
-  enabled: false
-  mode: "off"
+  # Which messages are eligible to CALL the local model on a cache miss:
+  # last_user (default, keeps resent history byte-stable for upstream prompt
+  # caching) | all | none (rules only, even in local/hybrid mode).
+  llm_scope: last_user
+  # Hard per-call timeout for the local model, in seconds.
+  llm_timeout_s: 15
 
 proxy:
   host: "127.0.0.1"
@@ -32,5 +34,4 @@ proxy:
   log_stats: true
 
 stats:
-  encoding: "cl100k_base"
   usd_per_mtok_input: 3.0
