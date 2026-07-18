@@ -146,6 +146,11 @@ impl Codec {
         &self.cache
     }
 
+    /// The local-LLM client — the proxy's `/health` runs its reachability probe.
+    pub fn llm(&self) -> &LlmClient {
+        &self.llm
+    }
+
     /// Encode a full message list per the role/scope policy documented above.
     /// Never fails: LLM problems degrade to the deterministic rules output.
     pub async fn encode_messages(&self, mut messages: Vec<Value>) -> EncodeResult {

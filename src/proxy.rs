@@ -20,7 +20,7 @@ use axum::extract::{Request, State};
 use axum::http::{header, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
@@ -56,6 +56,10 @@ pub fn create_app(cfg: AppConfig, config_source: String) -> Router {
 
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/completions", post(completions))
+        .route("/health", get(health))
+        // axum 0.8 wildcard: catches every other /v1/* path, any method.
+        .route("/v1/{*path}", any(catch_all))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             host_guard,
@@ -346,6 +350,144 @@ async fn chat_completions(State(state): State<Arc<AppState>>, request: Request) 
         stat_headers(&result.stats),
     )
     .await
+}
+
+// --- Completions -------------------------------------------------------------
+
+/// `POST /v1/completions`: give a non-empty string `prompt` the user
+/// compression treatment (LLM-eligible per config), then forward verbatim.
+async fn completions(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    let (parts, body) = request.into_parts();
+    let client_auth = parts.headers.get(header::AUTHORIZATION).cloned();
+
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => b,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "failed to read request body",
+            )
+        }
+    };
+    let mut payload: Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "invalid request body",
+            )
+        }
+    };
+
+    let prompt = match payload.get("prompt") {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    };
+    let mut extra = Vec::new();
+    if let Some(prompt) = prompt {
+        let (encoded, stats, notes) = state.codec.encode_text(&prompt, None).await;
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("prompt".to_string(), Value::String(encoded));
+        }
+        if state.cfg.proxy.log_stats {
+            tracing::info!(
+                before = stats.before_tokens,
+                after = stats.after_tokens,
+                pct_saved = stats.pct_saved(),
+                notes = ?notes,
+                "completions encode",
+            );
+        }
+        extra = stat_headers(&stats);
+    }
+
+    let new_body = match serde_json::to_vec(&payload) {
+        Ok(b) => Bytes::from(b),
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "failed to serialize request body",
+            )
+        }
+    };
+    forward(
+        &state,
+        Method::POST,
+        upstream_url(&state, "completions"),
+        Some(HeaderValue::from_static("application/json")),
+        client_auth,
+        new_body,
+        extra,
+    )
+    .await
+}
+
+// --- Raw catch-all -----------------------------------------------------------
+
+/// `any /v1/{*path}`: forward the original method, path, query, body bytes,
+/// client content-type, and auth verbatim — NO JSON parsing, no body mutation,
+/// no `x-prompt-codec-*` headers. Covers `/v1/embeddings`, `/v1/models`, etc.
+async fn catch_all(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    let (parts, body) = request.into_parts();
+    let method = parts.method;
+    let content_type = parts.headers.get(header::CONTENT_TYPE).cloned();
+    let client_auth = parts.headers.get(header::AUTHORIZATION).cloned();
+
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => b,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "failed to read request body",
+            )
+        }
+    };
+
+    // Incoming paths are `/v1/...`; the upstream base is the v1 root, so strip
+    // the `/v1` prefix and append the remainder (mirrors the chat/completions
+    // routes appending their own suffix to the base).
+    let path = parts.uri.path();
+    let suffix = path.strip_prefix("/v1").unwrap_or(path);
+    let mut url = upstream_url(&state, suffix);
+    if let Some(q) = parts.uri.query() {
+        url.push('?');
+        url.push_str(q);
+    }
+
+    forward(
+        &state,
+        method,
+        url,
+        content_type,
+        client_auth,
+        bytes,
+        Vec::new(),
+    )
+    .await
+}
+
+// --- Health ------------------------------------------------------------------
+
+/// `GET /health`: encoder/upstream/config provenance, live cache size, and a
+/// non-blocking local-LLM reachability probe. Never fails.
+async fn health(State(state): State<Arc<AppState>>) -> Response {
+    // Flush moka's pending write accounting so the count is accurate.
+    state.codec.cache().sync();
+    let cache_entries = state.codec.cache().entry_count();
+    let local = serde_json::to_value(state.codec.llm().health().await).unwrap_or(Value::Null);
+    let body = json!({
+        "ok": true,
+        "encoder_mode": state.cfg.encoder.mode,
+        "upstream": state.cfg.proxy.upstream_base_url,
+        "config_source": state.config_source,
+        "cache_entries": cache_entries,
+        "local": local,
+    });
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 #[cfg(test)]

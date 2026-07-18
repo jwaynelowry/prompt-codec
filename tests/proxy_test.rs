@@ -246,3 +246,165 @@ async fn non_loopback_host_header_is_rejected() {
         .unwrap();
     assert_eq!(r.status().as_u16(), 200);
 }
+
+// --- Task 11: completions, catch-all, SSE, health ---------------------------
+
+#[tokio::test]
+async fn completions_prompt_gets_user_treatment() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+    let proxy = spawn_proxy(rules_cfg(&format!("{}/v1", server.uri()))).await;
+    let client = Client::new();
+    let r = client
+        .post(format!("{proxy}/v1/completions"))
+        .json(&serde_json::json!({"prompt": FLUFFY, "model": "m"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let sent: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let prompt = sent["prompt"].as_str().unwrap();
+    assert!(
+        !prompt.contains("Thank you"),
+        "prompt should get the user compression treatment; got: {prompt}"
+    );
+    assert!(prompt.contains("src/auth.rs"), "real content preserved");
+    assert_eq!(sent["model"], "m", "other fields untouched");
+}
+
+#[tokio::test]
+async fn catch_all_forwards_raw_body_query_and_method() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .insert_header("x-up", "1")
+                .set_body_string("resp-body"),
+        )
+        .mount(&server)
+        .await;
+    let proxy = spawn_proxy(rules_cfg(&format!("{}/v1", server.uri()))).await;
+    let client = Client::new();
+
+    let raw: &[u8] = b"rawbytes\x00\x01";
+    let r = client
+        .post(format!("{proxy}/v1/embeddings?foo=bar"))
+        .header("content-type", "application/x-raw-test")
+        .body(raw.to_vec())
+        .send()
+        .await
+        .unwrap();
+
+    // Response passes through unchanged.
+    assert_eq!(r.status().as_u16(), 201);
+    assert_eq!(r.headers().get("x-up").unwrap().to_str().unwrap(), "1");
+    assert_eq!(r.text().await.unwrap(), "resp-body");
+
+    // Upstream got the raw bytes, the query, the method, and content-type.
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body.as_slice(), raw, "raw body byte-identical");
+    assert_eq!(requests[0].url.query(), Some("foo=bar"), "query preserved");
+    assert_eq!(requests[0].method.as_str(), "POST", "method preserved");
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "application/x-raw-test",
+        "content-type preserved"
+    );
+}
+
+#[tokio::test]
+async fn get_models_passes_through_catch_all() {
+    const MODELS: &str = r#"{"data":[{"id":"m"}]}"#;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_string(MODELS),
+        )
+        .mount(&server)
+        .await;
+    let proxy = spawn_proxy(rules_cfg(&format!("{}/v1", server.uri()))).await;
+    let client = Client::new();
+    let r = client
+        .get(format!("{proxy}/v1/models"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(r.text().await.unwrap(), MODELS);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method.as_str(), "GET");
+    assert!(requests[0].body.is_empty(), "GET forwards with no body");
+}
+
+#[tokio::test]
+async fn sse_stream_chunks_pass_through_byte_identical() {
+    const SSE: &str = "data: {\"a\":1}\n\ndata: [DONE]\n\n";
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        // set_body_raw sets the content-type directly (set_body_string would
+        // reset it to text/plain).
+        .respond_with(ResponseTemplate::new(200).set_body_raw(SSE.as_bytes(), "text/event-stream"))
+        .mount(&server)
+        .await;
+    let proxy = spawn_proxy(rules_cfg(&format!("{}/v1", server.uri()))).await;
+    let client = Client::new();
+    let r = client
+        .post(format!("{proxy}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello world here friend"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(
+        r.headers().get("content-type").unwrap().to_str().unwrap(),
+        "text/event-stream",
+        "SSE content-type preserved"
+    );
+    assert_eq!(r.text().await.unwrap(), SSE, "SSE body byte-identical");
+}
+
+#[tokio::test]
+async fn health_reports_without_blocking() {
+    let mut cfg = AppConfig::default();
+    cfg.local.base_url = "http://127.0.0.1:1/v1".into(); // unreachable local LLM
+    let proxy = spawn_proxy(cfg).await;
+    let client = Client::new();
+
+    let fut = client.get(format!("{proxy}/health")).send();
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(4), fut)
+        .await
+        .expect("health must return without blocking")
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["local"]["ok"], false, "unreachable local LLM");
+    assert!(
+        body["local"]["model_present"].is_null(),
+        "model_present is null when the listing is unavailable"
+    );
+    assert_eq!(body["config_source"], "test-config");
+    assert!(body["cache_entries"].is_number());
+}
