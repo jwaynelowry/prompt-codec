@@ -1,5 +1,5 @@
-//! Golden-corpus tests: exercise `rules_compress` on realistic, larger inputs
-//! (tests/corpus/*) rather than the small hand-crafted strings in
+//! Golden-corpus tests: exercise `rules_compress` on representative, larger
+//! inputs (tests/corpus/*) rather than the small hand-crafted strings in
 //! `src/rules.rs`'s unit tests. Guards two properties end-to-end:
 //! - Real verbose prose still saves a meaningful fraction of tokens.
 //! - Fenced code/JSON survives byte-for-byte (aside from exact-duplicate
@@ -12,6 +12,8 @@ use prompt_codec::tokenizer::count_tokens;
 /// A duplicated fence body is intentionally collapsed to one entry here: the
 /// pipeline replaces the *second and later* occurrences with a marker, so
 /// only the first occurrence's body is guaranteed to survive verbatim.
+/// Assumes no real corpus fence body equals the duplicate-removal marker text
+/// ("[duplicate code block removed]") — a corpus that did would false-pass.
 fn unique_fence_bodies(s: &str) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     segment(s)

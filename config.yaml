@@ -4,8 +4,7 @@
 local:
   base_url: "http://127.0.0.1:11434/v1"
   api_key: "ollama"
-  # gemma4:12b-mlx isn't a real tag on this box — pinned to what `ollama list`
-  # actually has. Swap for your own local/MLX/Exo model tag.
+  # gemma4:12b-mlx does not exist; use a tag from `ollama list` (or your MLX/Exo tag)
   model: "gemma3:4b"
   temperature: 0.1
   max_tokens: 2048

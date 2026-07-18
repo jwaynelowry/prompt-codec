@@ -67,46 +67,9 @@ enum Cmd {
 
 /// The demo sample prompt, ported verbatim from
 /// `legacy/prompt_codec/cli.py` (`sample = """..."""`, lines ~135-174).
-const DEMO_SAMPLE: &str = r#"
-Please, I would like you to help me with something very important. Thank you so much in advance!
-
-I hope this helps set context. As an AI you are very capable.
-
-I need you to refactor the authentication module in our codebase.
-
-Important: Please remember to keep everything secure.
-
-The file is at src/auth/session.py. There is also src/auth/session.py that handles sessions.
-There is a bug where refresh tokens are not rotated. Error text:
-  TokenRotationError: expected new jti, got reuse of abc123
-
-Requirements:
-- Rotate refresh tokens on every use
-- Invalidate old token family on reuse detection
-- Add unit tests
-- Keep the public API stable
-- Use existing logging helpers
-
-Please also:
-- Write clean code
-- Add comments where needed
-- Follow best practices
-- Make it production ready
-- Thank you!
-
-Bullet dump of extra context that is somewhat redundant:
-- auth uses JWT
-- auth uses JWT
-- refresh tokens live in Redis
-- Redis key prefix: sess:
-- TTL is 30 days
-- TTL is 30 days
-- We use FastAPI
-- We use Python 3.11
-- CI runs pytest
-- Please be careful
-- Note: this is important
-"#;
+/// Single-sourced from the golden corpus so the demo and the corpus tests
+/// can never drift apart.
+const DEMO_SAMPLE: &str = include_str!("../tests/corpus/fluffy.txt");
 
 fn print_config_warnings(warnings: &[String]) {
     for w in warnings {

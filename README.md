@@ -39,10 +39,11 @@ cd ~/projects/prompt-codec
 cargo run -- demo
 cargo run -- encode --mode rules -f some_prompt.txt
 cargo run -- health
-cargo run -- proxy
 # or, after `cargo build --release`:
 ./target/release/prompt-codec demo
 ```
+
+To run the server (`cargo run -- proxy` — it blocks the terminal), see the [Proxy section](#proxy-route-any-openai-client-through-the-codec) below.
 
 ## Local model (stronger savings)
 
