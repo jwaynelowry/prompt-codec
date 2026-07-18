@@ -9,8 +9,8 @@ use clap::{Parser, Subcommand};
 use prompt_codec::cli::{read_input, render_savings, Mode};
 use prompt_codec::codec::Codec;
 use prompt_codec::config::resolve_config;
-use prompt_codec::llm::LlmClient;
-use prompt_codec::proxy::{cfg_host_is_loopback, create_app};
+use prompt_codec::llm::{keep_alive_loop, repin_interval, LlmClient};
+use prompt_codec::proxy::{cfg_host_is_loopback, create_app_with_state, flush_totals};
 use prompt_codec::tokenizer::count_tokens;
 
 #[derive(Parser)]
@@ -230,6 +230,17 @@ async fn main() -> anyhow::Result<()> {
                         cfg.local.model, cfg.encoder.mode, cfg.local.model
                     );
                 }
+
+                // Warm-model keep-alive pinner (v0.3): proxy only, local/hybrid
+                // only — pinning a model `rules` mode never calls would waste
+                // RAM. The probe above is done with `llm`, so it moves into the
+                // spawned task; the loop runs concurrently with serving and
+                // must never delay `axum::serve` below.
+                if !cfg.local.keep_alive.is_empty() {
+                    let keep_alive = cfg.local.keep_alive.clone();
+                    let interval = repin_interval(&keep_alive);
+                    tokio::spawn(keep_alive_loop(llm, keep_alive, interval));
+                }
             }
 
             let addr = format!("{}:{}", cfg.proxy.host, cfg.proxy.port);
@@ -239,15 +250,36 @@ async fn main() -> anyhow::Result<()> {
             println!("Upstream base: {}", cfg.proxy.upstream_base_url);
 
             let source = loaded.source.clone();
-            let app = create_app(cfg, source);
+            let (app, state) = create_app_with_state(cfg, source);
             let listener = tokio::net::TcpListener::bind(&addr)
                 .await
                 .with_context(|| format!("failed to bind {addr}"))?;
             axum::serve(listener, app)
                 .with_graceful_shutdown(async {
+                    // Both polite shutdown paths release serve so the totals
+                    // flush below runs: ctrl-c (SIGINT) AND `kill <pid>`/launchd
+                    // (SIGTERM). SIGKILL still loses the tail — accepted.
+                    #[cfg(unix)]
+                    {
+                        use tokio::signal::unix::{signal, SignalKind};
+                        match signal(SignalKind::terminate()) {
+                            Ok(mut term) => tokio::select! {
+                                _ = tokio::signal::ctrl_c() => {}
+                                _ = term.recv() => {}
+                            },
+                            Err(_) => {
+                                tokio::signal::ctrl_c().await.ok();
+                            }
+                        }
+                    }
+                    #[cfg(not(unix))]
                     tokio::signal::ctrl_c().await.ok();
                 })
                 .await?;
+            // Graceful-shutdown (SIGINT/SIGTERM) flush: persist the final
+            // savings totals so the next process picks them up. A hard kill may
+            // lose the last few requests' counting — accepted per spec.
+            flush_totals(&state);
         }
     }
 

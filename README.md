@@ -79,6 +79,78 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   -d '{"model":"grok-4.5","messages":[{"role":"user","content":"…long prompt…"}]}'
 ```
 
+### Savings telemetry (`GET /health`, new in v0.3)
+
+`/health` reports a cumulative `totals` object across the proxy's lifetime,
+persisted in the SQLite cache `meta` table (survives restarts; session-only
+when `cache.persist: false`):
+
+```json
+"totals": {
+  "requests": 1234,               // requests that produced compression stats
+  "before_tokens": 5678901,
+  "after_tokens": 3456789,
+  "saved_tokens": 2222112,        // derived: before − after (clamped at 0)
+  "usd_saved_est": 6.666336,      // saved / 1e6 × stats.usd_per_mtok_input (same key as encode --json)
+  "upstream_cached_tokens": 890123,
+  "responses_with_cache_info": 1100,
+  "since": "2026-07-18T17:00:00Z" // when the totals row was first created
+}
+```
+
+Totals are **per proxy port** (`totals_json:{port}` in the meta table), so
+concurrent proxies sharing one cache DB — e.g. the xAI proxy on 8787 and the
+GLM demo on 8788 — keep independent counts, while the rewrite rows themselves
+stay shared across all instances.
+
+`upstream_cached_tokens` is **best-effort**: the proxy taps only the last 16 KB
+of each `/v1/chat/completions`, `/v1/completions`, and `/v1/messages` response
+(bytes forwarded unchanged, no full-body buffering) and regex-scans that tail
+for the provider's prompt-cache usage — both OpenAI (`cached_tokens`) and
+Anthropic/Z.ai (`cache_read_input_tokens`) shapes. Non-streaming responses
+always carry it; OpenAI-style streaming responses only when the client
+requested `stream_options.include_usage`, and Anthropic-style streams usually
+report usage in the `message_start` event at the **head** of the stream, which
+can fall outside the 16 KB tail ring on long replies. When the tail has no
+usage block, nothing is recorded — the counter simply doesn't grow. Totals are
+flushed on every `/health` read, every 32 counted requests, and at graceful
+(SIGINT/SIGTERM) shutdown; a hard kill may lose the last few requests'
+counting.
+
+### GLM demo + dashboard (draft, new in v0.3)
+
+The proxy can also front an **Anthropic-format** upstream: `POST /v1/messages`
+compresses the `messages` array in place (string content and `{"type":"text"}`
+blocks get the user treatment; `tool_result` and other block types pass through
+untouched; the top-level `system` field is left alone) and forwards verbatim,
+exactly like the OpenAI routes. Pair it with `proxy.upstream_auth_style:
+x_api_key` for `x-api-key` + `anthropic-version` auth.
+
+`config.glm.yaml` wires this to Z.ai's GLM 5.2 endpoint on port **8788** (so it
+runs alongside the xAI proxy on 8787). Launch it with:
+
+```bash
+export Z_AI_API_KEY=...            # or let the script load it (see below)
+./target/release/prompt-codec proxy --config config.glm.yaml
+# → dashboard at http://127.0.0.1:8788/dashboard
+```
+
+`scripts/run_glm_demo.sh` loads `Z_AI_API_KEY` from `~/.claude/settings.local.json`
+(the `env` object) into the child process **without echoing the value**, builds
+the release binary if needed, and execs the proxy:
+
+```bash
+scripts/run_glm_demo.sh
+```
+
+**Dashboard** (`GET /dashboard`, draft UI — functional over pretty): a single
+self-contained page (no external assets, works offline under the host guard).
+It shows the lifetime totals cards (requests, tokens saved, est. $ saved,
+upstream cached tokens), a recent-requests table (last 20, session-only), and a
+**test-drive** box — type a prompt, it's compressed, sent to GLM 5.2 via
+`/v1/messages`, and the reply plus the `x-prompt-codec-*` savings headers are
+shown. The page polls `GET /dashboard/data` (totals + recent ring) every 2 s.
+
 ### Hermes wiring
 
 In `~/.hermes/config.yaml` (or a custom provider), add a provider that hits the proxy:
@@ -149,6 +221,7 @@ See `config.yaml` (your live config) / `config.example.yaml` (fully commented v2
 | `local.reasoning_effort` | `none` | stops thinking models burning the output budget on hidden reasoning; `""` omits the field |
 | `local.temperature` | `0.1` | |
 | `local.max_tokens` | `2048` | ceiling; actual budget is sized per call |
+| `local.keep_alive` **(new in v0.3)** | `60m` | model residency window pinned via Ollama's native `/api/generate` call (proxy only, `local`/`hybrid` mode only); re-pinned every half the window (min 60s), so the cadence follows the value; `"-1"` = keep loaded forever (pinned once); `""` disables pinning. Non-Ollama servers log one warning and stop after the first failed pin attempt |
 | `encoder.mode` | `hybrid` | `rules` \| `local` \| `hybrid` |
 | `encoder.target_ratio` | `0.45` | local-LLM target compression |
 | `encoder.protect_system_under_chars` | `800` | leave short system prompts alone |
@@ -157,11 +230,15 @@ See `config.yaml` (your live config) / `config.example.yaml` (fully commented v2
 | `encoder.llm_scope` **(new)** | `last_user` | `last_user` \| `all` \| `none` — see above |
 | `encoder.llm_timeout_s` **(new)** | `15` | hard per-call timeout, seconds |
 | `encoder.list_trim_enabled` **(new)** | `false` | reserved, no-op today |
-| `cache.max_entries` **(new)** | `4096` | LRU accepted-rewrite cache size |
+| `cache.max_entries` **(new)** | `4096` | in-memory LRU accepted-rewrite cache size |
+| `cache.persist` **(new in v0.3)** | `true` | enable the durable SQLite tier (rewrites survive restarts, shared with CLI one-shots); `false` = memory-only. A broken disk degrades to memory-only with one warning |
+| `cache.path` **(new in v0.3)** | platform cache dir | override the SQLite DB location; default `~/Library/Caches/prompt-codec/rewrites.sqlite3` on macOS (falls back to `./prompt-codec-cache.sqlite3`) |
+| `cache.max_disk_entries` **(new in v0.3)** | `100000` | disk-tier prune threshold (oldest-by-last-used evicted first) |
 | `proxy.host` / `proxy.port` | `127.0.0.1` / `8787` | |
 | `proxy.upstream_base_url` | `https://api.x.ai/v1` | your paid provider |
 | `proxy.upstream_api_key_env` | `X_API_KEY` | env var holding the key — never hardcode it |
-| `proxy.pass_client_auth` | `true` | forward client's own Authorization upstream |
+| `proxy.upstream_auth_style` **(new in v0.3)** | `bearer` | `bearer` (`Authorization: Bearer`, OpenAI/xAI) \| `x_api_key` (`x-api-key` + `anthropic-version`, for Anthropic-format upstreams like Z.ai's GLM endpoint — see `config.glm.yaml`) |
+| `proxy.pass_client_auth` | `true` | forward client's own auth header upstream (Authorization in `bearer`, x-api-key in `x_api_key`) |
 | `proxy.require_client_auth` **(new)** | `false` | 401 any request with no Authorization at all |
 | `proxy.log_stats` | `true` | log before/after tokens + notes to stderr |
 | `stats.usd_per_mtok_input` | `3.0` | rough $ savings display only |

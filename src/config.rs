@@ -29,6 +29,11 @@ pub struct LocalConfig {
     /// hidden reasoning and return truncated/empty content. Set to "" if your
     /// OpenAI-compatible server rejects the field.
     pub reasoning_effort: String,
+    /// Keep-alive window sent to Ollama's native `/api/generate` pin call
+    /// (v0.3 warm-model keep-alive pinner) so the model stays resident
+    /// between requests instead of unloading after Ollama's idle default
+    /// (~5 min). `""` disables pinning entirely.
+    pub keep_alive: String,
 }
 
 impl Default for LocalConfig {
@@ -40,6 +45,7 @@ impl Default for LocalConfig {
             temperature: 0.1,
             max_tokens: 2048,
             reasoning_effort: "none".to_string(),
+            keep_alive: "60m".to_string(),
         }
     }
 }
@@ -76,11 +82,26 @@ impl Default for EncoderConfig {
 #[serde(default)]
 pub struct CacheConfig {
     pub max_entries: u64,
+    /// Enable the durable SQLite tier (v0.3). `false` restores v0.2
+    /// memory-only behavior — nothing is ever written to disk.
+    pub persist: bool,
+    /// Override the SQLite DB location. `None` resolves to
+    /// `dirs::cache_dir()/prompt-codec/rewrites.sqlite3` (falling back to
+    /// `./prompt-codec-cache.sqlite3` when no cache dir resolves).
+    pub path: Option<PathBuf>,
+    /// Prune the disk tier back toward this many rows (oldest-by-`last_used`
+    /// evicted first) once it grows past the cap.
+    pub max_disk_entries: u64,
 }
 
 impl Default for CacheConfig {
     fn default() -> Self {
-        Self { max_entries: 4096 }
+        Self {
+            max_entries: 4096,
+            persist: true,
+            path: None,
+            max_disk_entries: 100_000,
+        }
     }
 }
 
@@ -94,6 +115,11 @@ pub struct ProxyConfig {
     pub pass_client_auth: bool,
     pub require_client_auth: bool,
     pub log_stats: bool,
+    /// How to authenticate to the upstream (v0.3 Feature 4):
+    /// - `"bearer"` (default): `Authorization: Bearer <key>` (OpenAI/xAI).
+    /// - `"x_api_key"`: `x-api-key: <key>` plus a forwarded `anthropic-version`
+    ///   header (Anthropic-format upstreams, e.g. Z.ai's GLM endpoint).
+    pub upstream_auth_style: String,
 }
 
 impl Default for ProxyConfig {
@@ -106,6 +132,7 @@ impl Default for ProxyConfig {
             pass_client_auth: true,
             require_client_auth: false,
             log_stats: true,
+            upstream_auth_style: "bearer".to_string(),
         }
     }
 }
@@ -156,6 +183,7 @@ const KNOWN_SECTIONS: &[(&str, &[&str])] = &[
             "temperature",
             "max_tokens",
             "reasoning_effort",
+            "keep_alive",
         ],
     ),
     (
@@ -171,7 +199,10 @@ const KNOWN_SECTIONS: &[(&str, &[&str])] = &[
             "list_trim_enabled",
         ],
     ),
-    ("cache", &["max_entries"]),
+    (
+        "cache",
+        &["max_entries", "persist", "path", "max_disk_entries"],
+    ),
     (
         "proxy",
         &[
@@ -182,6 +213,7 @@ const KNOWN_SECTIONS: &[(&str, &[&str])] = &[
             "require_client_auth",
             "log_stats",
             "port",
+            "upstream_auth_style",
         ],
     ),
     ("stats", &["usd_per_mtok_input"]),
@@ -262,7 +294,7 @@ pub fn load_config_from(path: &Path) -> anyhow::Result<LoadedConfig> {
         .with_context(|| format!("failed to parse YAML config: {}", path.display()))?;
     let mut warnings = Vec::new();
     let value = sanitize(value, &mut warnings);
-    let config: AppConfig = serde_yaml::from_value(value)
+    let mut config: AppConfig = serde_yaml::from_value(value)
         .with_context(|| format!("failed to load config: {}", path.display()))?;
     // Known-but-unimplemented knob: accepted so v1 configs load cleanly, but
     // the user deserves to know it does nothing.
@@ -270,6 +302,20 @@ pub fn load_config_from(path: &Path) -> anyhow::Result<LoadedConfig> {
         warnings.push(
             "encoder.list_trim_enabled is reserved and not implemented in v2; ignored".to_string(),
         );
+    }
+    // v0.3: the auth style is an enum-in-a-string; a typo (e.g. "x-api-key")
+    // would otherwise silently behave as bearer and surface only as an opaque
+    // upstream 401. Warn loudly at load time and fall back to bearer explicitly
+    // — consistent with this module's warn-don't-error posture.
+    if !matches!(
+        config.proxy.upstream_auth_style.as_str(),
+        "bearer" | "x_api_key"
+    ) {
+        warnings.push(format!(
+            "unknown proxy.upstream_auth_style '{}'; falling back to 'bearer' (valid: bearer, x_api_key)",
+            config.proxy.upstream_auth_style
+        ));
+        config.proxy.upstream_auth_style = "bearer".to_string();
     }
     Ok(LoadedConfig {
         config,
@@ -390,6 +436,32 @@ mod tests {
         std::fs::write(&p, "encoder:\n  list_trim_enabled: false\n").unwrap();
         let loaded = load_config_from(&p).unwrap();
         assert!(loaded.warnings.is_empty());
+    }
+
+    #[test]
+    fn invalid_upstream_auth_style_warns_and_falls_back_to_bearer() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.yaml");
+        // A plausible typo: the header name instead of the style name.
+        std::fs::write(&p, "proxy:\n  upstream_auth_style: \"x-api-key\"\n").unwrap();
+        let loaded = load_config_from(&p).unwrap();
+        assert_eq!(
+            loaded.config.proxy.upstream_auth_style, "bearer",
+            "invalid style must fall back to bearer explicitly"
+        );
+        let joined = loaded.warnings.join("\n");
+        assert!(
+            joined.contains("x-api-key") && joined.contains("bearer"),
+            "warning names the bad value and the fallback; got: {joined}"
+        );
+
+        // Both valid values load silently.
+        for style in ["bearer", "x_api_key"] {
+            std::fs::write(&p, format!("proxy:\n  upstream_auth_style: \"{style}\"\n")).unwrap();
+            let loaded = load_config_from(&p).unwrap();
+            assert_eq!(loaded.config.proxy.upstream_auth_style, style);
+            assert!(loaded.warnings.is_empty(), "valid '{style}' must not warn");
+        }
     }
 
     #[test]

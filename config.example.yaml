@@ -18,6 +18,15 @@ local:
   reasoning_effort: "none"                   # default: "none" — stops thinking models (Gemma 4 etc.) burning
                                              # the output budget on hidden reasoning; "" omits the field for
                                              # servers that reject it
+  # Warm-model keep-alive pinner (v0.3, proxy only, local/hybrid mode only):
+  # pins the model resident via Ollama's native /api/generate call on startup
+  # and every half this window thereafter (never more often than once a
+  # minute), so hybrid latency stays ~1s instead of paying Ollama's ~10s cold
+  # reload after its default ~5 min idle unload. Accepts "90s"/"10m"/"1h" or
+  # bare seconds ("300"); "-1" = keep loaded forever (pinned once); "" disables
+  # pinning entirely. Non-Ollama servers (MLX-LM, Exo) log one warning and
+  # stop after the first failed attempt — never retry-spammed.
+  keep_alive: "60m"                          # default: 60m (re-pinned every 30m)
 
 encoder:
   # rules  = free deterministic compression only, no model needed
@@ -54,9 +63,25 @@ encoder:
   list_trim_enabled: false                   # default: false
 
 cache:
-  # Max accepted-rewrite cache entries (LRU eviction beyond this bound).
-  # Keyed on sha256(model|target_ratio|content), shared by the CLI and proxy.
+  # Max in-memory accepted-rewrite cache entries (LRU eviction beyond this
+  # bound). Keyed on sha256(model|target_ratio|content), shared by CLI & proxy.
   max_entries: 4096                          # default: 4096
+
+  # Persistent (SQLite) cache tier: accepted rewrites survive proxy restarts
+  # and are shared with CLI one-shots, so compressed history stays byte-stable
+  # across restarts (protecting upstream prompt-cache discounts) and no
+  # compression is ever paid for twice. false = v0.2 memory-only behavior.
+  # A broken/unwritable DB degrades to memory-only with a single warning.
+  persist: true                              # default: true
+
+  # Override the SQLite DB location. Omit to use the platform cache dir:
+  #   macOS: ~/Library/Caches/prompt-codec/rewrites.sqlite3
+  # (falls back to ./prompt-codec-cache.sqlite3 if no cache dir resolves).
+  # path: "/custom/path/rewrites.sqlite3"    # default: platform cache dir
+
+  # Prune the disk tier back toward this many rows once it grows past the cap
+  # (oldest-by-last-used evicted first).
+  max_disk_entries: 100000                   # default: 100000
 
 proxy:
   host: "127.0.0.1"                          # default: 127.0.0.1
@@ -65,8 +90,15 @@ proxy:
   upstream_base_url: "https://api.x.ai/v1"    # default: https://api.x.ai/v1
   # Env var name holding the upstream API key. Never hardcode secrets here.
   upstream_api_key_env: "X_API_KEY"           # default: X_API_KEY
-  # Forward the client's own Authorization header upstream when present,
-  # falling back to the env-var key above when it isn't.
+  # How to authenticate to the upstream (v0.3):
+  #   bearer     - Authorization: Bearer <key>  (OpenAI / xAI; default)
+  #   x_api_key  - x-api-key: <key> + an anthropic-version header
+  #                (Anthropic-format upstreams, e.g. Z.ai's GLM endpoint —
+  #                 see config.glm.yaml)
+  upstream_auth_style: "bearer"               # default: bearer
+  # Forward the client's own auth header upstream when present (Authorization in
+  # bearer style, x-api-key in x_api_key style), falling back to the env-var key
+  # above when it isn't.
   pass_client_auth: true                      # default: true
   # Reject requests with no Authorization header at all (401) before they
   # ever reach the codec or upstream. Off by default since this proxy is

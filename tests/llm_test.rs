@@ -3,7 +3,7 @@
 #![allow(clippy::field_reassign_with_default)]
 
 use prompt_codec::config::LocalConfig;
-use prompt_codec::llm::LlmClient;
+use prompt_codec::llm::{keep_alive_loop, LlmClient};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -147,6 +147,72 @@ async fn invalid_timeout_values_do_not_panic() {
     for bad in [f64::NAN, f64::INFINITY, -3.0, 0.0, 1e300] {
         let _ = LlmClient::new(&LocalConfig::default(), bad);
     }
+}
+
+#[tokio::test]
+async fn pin_posts_native_generate() {
+    // The pin call hits Ollama's NATIVE endpoint (no /v1 prefix) even though
+    // the configured base_url carries one, proving the /v1-strip works.
+    use wiremock::matchers::body_partial_json;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/generate"))
+        .and(body_partial_json(serde_json::json!({
+            "model": LocalConfig::default().model,
+            "prompt": "",
+            "keep_alive": "60m",
+            "stream": false,
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"done": true})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (c, t) = cfg(&server.uri(), 5.0);
+    let llm = LlmClient::new(&c, t);
+    llm.pin_model("60m").await.unwrap();
+}
+
+#[tokio::test]
+async fn pin_stops_after_unsupported() {
+    // A non-Ollama server (MLX-LM, Exo) 404s the native endpoint. The loop
+    // must warn once and stop — never retry-spam a server that doesn't
+    // support the pin call.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/generate"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let (c, t) = cfg(&server.uri(), 5.0);
+    let llm = LlmClient::new(&c, t);
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        keep_alive_loop(
+            llm,
+            "60m".to_string(),
+            Some(std::time::Duration::from_millis(50)),
+        ),
+    )
+    .await;
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn negative_keep_alive_pins_exactly_once() {
+    // "-1" = Ollama keeps the model loaded forever; one successful pin
+    // suffices and the loop must exit on its own (interval None) rather
+    // than re-pin.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/generate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"done": true})))
+        .mount(&server)
+        .await;
+    let (c, t) = cfg(&server.uri(), 5.0);
+    let llm = LlmClient::new(&c, t);
+    // No timeout wrapper: the loop itself must return after the first pin.
+    keep_alive_loop(llm, "-1".to_string(), None).await;
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 #[tokio::test]

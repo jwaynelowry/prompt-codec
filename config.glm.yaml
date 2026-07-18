@@ -1,0 +1,24 @@
+# GLM 5.2 demo config (v0.3 Feature 4). Runs the codec proxy against Z.ai's
+# Anthropic-format endpoint on port 8788 — alongside the xAI proxy on 8787.
+# Start it with: scripts/run_glm_demo.sh  (loads Z_AI_API_KEY without echoing it)
+# then open the dashboard at http://127.0.0.1:8788/dashboard
+#
+# NOTE: no secrets live in this file. The upstream key is read at runtime from
+# the env var named below (upstream_api_key_env), exported by the launch script.
+
+proxy:
+  port: 8788
+  # Z.ai's Anthropic-compatible base. POST /v1/messages lands at {base}/messages.
+  upstream_base_url: "https://api.z.ai/api/anthropic/v1"
+  # Anthropic-style auth: send the key as `x-api-key` (not `Authorization: Bearer`)
+  # and forward an `anthropic-version` header.
+  upstream_auth_style: "x_api_key"
+  # Env var holding the GLM key — never hardcode it here.
+  upstream_api_key_env: "Z_AI_API_KEY"
+  # Forward a client's own x-api-key when present; else use the env key above.
+  pass_client_auth: true
+
+encoder:
+  # Rules first, then local-model refine (best savings) — the local model is
+  # only used if reachable; otherwise requests degrade to rules-only.
+  mode: hybrid

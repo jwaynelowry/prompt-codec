@@ -30,6 +30,8 @@ fn rules_cfg(upstream_base: &str) -> AppConfig {
     let mut cfg = AppConfig::default();
     cfg.encoder.mode = "rules".into(); // deterministic, no local LLM needed
     cfg.proxy.upstream_base_url = upstream_base.to_string();
+    // Hermetic: never touch the user's real cache dir during tests.
+    cfg.cache.persist = false;
     cfg
 }
 
@@ -555,6 +557,7 @@ async fn streaming_chunks_are_delivered_incrementally() {
 async fn health_reports_without_blocking() {
     let mut cfg = AppConfig::default();
     cfg.local.base_url = "http://127.0.0.1:1/v1".into(); // unreachable local LLM
+    cfg.cache.persist = false; // hermetic: no real cache dir in tests
     let proxy = spawn_proxy(cfg).await;
     let client = Client::new();
 
@@ -573,4 +576,430 @@ async fn health_reports_without_blocking() {
     );
     assert_eq!(body["config_source"], "test-config");
     assert!(body["cache_entries"].is_number());
+    // Persistence is off in this test: the disk tier fields report absence.
+    assert!(
+        body["cache_disk_entries"].is_null(),
+        "disk entries null when persistence is off"
+    );
+    assert!(
+        body["cache_path"].is_null(),
+        "cache_path null when persistence is off"
+    );
+    // Default config keeps keep_alive on ("60m") — /health surfaces it.
+    assert_eq!(body["local"]["keep_alive"], "60m");
+}
+
+#[tokio::test]
+async fn health_omits_keep_alive_when_disabled() {
+    let mut cfg = AppConfig::default();
+    cfg.local.base_url = "http://127.0.0.1:1/v1".into();
+    cfg.local.keep_alive = String::new(); // pinning disabled
+    cfg.cache.persist = false;
+    let proxy = spawn_proxy(cfg).await;
+    let client = Client::new();
+    let resp = client.get(format!("{proxy}/health")).send().await.unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["local"]["keep_alive"].is_null());
+}
+
+// --- Task 3: savings telemetry ----------------------------------------------
+
+#[tokio::test]
+async fn health_totals_accumulate() {
+    // Upstream body carries an OpenAI usage block with a cached-token count; the
+    // tail inspector must capture it without altering the forwarded bytes.
+    const RESP: &str = r#"{"id":"chatcmpl-x","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"done"}}],"usage":{"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":40}}}"#;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_string(RESP),
+        )
+        .mount(&server)
+        .await;
+
+    let proxy = spawn_proxy(rules_cfg(&format!("{}/v1", server.uri()))).await;
+    let client = Client::new();
+    for _ in 0..2 {
+        let r = client
+            .post(format!("{proxy}/v1/chat/completions"))
+            .json(&serde_json::json!({"messages": [{"role": "user", "content": FLUFFY}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        // Drain the full body so the inspector reaches stream-end and folds in
+        // the cached-token count before we read /health.
+        assert_eq!(
+            r.text().await.unwrap(),
+            RESP,
+            "body forwarded byte-identical"
+        );
+    }
+
+    let health: serde_json::Value = client
+        .get(format!("{proxy}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let t = &health["totals"];
+    assert_eq!(t["requests"], 2, "two compressed requests counted");
+    assert!(
+        t["saved_tokens"].as_u64().unwrap() > 0,
+        "rules compression saved tokens"
+    );
+    assert!(t["before_tokens"].as_u64().unwrap() > t["after_tokens"].as_u64().unwrap());
+    assert_eq!(
+        t["upstream_cached_tokens"], 80,
+        "40 cached tokens × 2 responses"
+    );
+    assert_eq!(t["responses_with_cache_info"], 2);
+    assert!(t["since"].as_str().unwrap().ends_with('Z'), "RFC3339 since");
+    // Field-name pin: the USD key matches stats.rs' `usd_saved_est` (one name
+    // across every JSON surface — encode --json and /health totals).
+    assert!(
+        t["usd_saved_est"].as_f64().unwrap() > 0.0,
+        "usd_saved_est present under the standardized name"
+    );
+}
+
+#[tokio::test]
+async fn totals_survive_restart() {
+    const RESP: &str = r#"{"choices":[{"message":{"role":"assistant","content":"done"}}]}"#;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(RESP))
+        .mount(&server)
+        .await;
+
+    // Persist ON, on an isolated tempdir cache path (never the user's real dir).
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = rules_cfg(&format!("{}/v1", server.uri()));
+    cfg.cache.persist = true;
+    cfg.cache.path = Some(dir.path().join("rewrites.sqlite3"));
+
+    // Proxy A: one compressed request, then GET /health to flush totals to disk.
+    let proxy_a = spawn_proxy(cfg.clone()).await;
+    let client = Client::new();
+    let r = client
+        .post(format!("{proxy_a}/v1/chat/completions"))
+        .json(&serde_json::json!({"messages": [{"role": "user", "content": FLUFFY}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let _ = r.text().await.unwrap();
+    let health_a: serde_json::Value = client
+        .get(format!("{proxy_a}/health")) // /health flushes totals_json
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(health_a["totals"]["requests"], 1);
+
+    // Proxy B: fresh process state, SAME cache path — totals carry over.
+    let proxy_b = spawn_proxy(cfg).await;
+    let health_b: serde_json::Value = client
+        .get(format!("{proxy_b}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        health_b["totals"]["requests"].as_u64().unwrap() >= 1,
+        "restarted proxy carried over the prior request count"
+    );
+    // `since` is the ORIGINAL creation stamp, preserved across the restart.
+    assert_eq!(
+        health_b["totals"]["since"], health_a["totals"]["since"],
+        "since is preserved across restart, not reset"
+    );
+}
+
+/// Drive `n` compressed chat requests through a persist=true proxy on a fresh
+/// tempdir — deliberately NEVER reading /health on it (that would flush) — then
+/// spawn a second proxy on the same path and report the request count its
+/// totals carried over. Isolates the every-32-requests flush trigger.
+async fn requests_carried_after_restart(upstream_base: &str, n: usize) -> u64 {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = rules_cfg(upstream_base);
+    cfg.cache.persist = true;
+    cfg.cache.path = Some(dir.path().join("rewrites.sqlite3"));
+
+    let proxy_a = spawn_proxy(cfg.clone()).await;
+    let client = Client::new();
+    for _ in 0..n {
+        let r = client
+            .post(format!("{proxy_a}/v1/chat/completions"))
+            .json(&serde_json::json!({"messages": [{"role": "user", "content": FLUFFY}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        let _ = r.text().await.unwrap();
+    }
+
+    // Restart onto the same DB: whatever was flushed is what carries over.
+    let proxy_b = spawn_proxy(cfg).await;
+    let health: serde_json::Value = client
+        .get(format!("{proxy_b}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    health["totals"]["requests"].as_u64().unwrap()
+}
+
+#[tokio::test]
+async fn totals_flush_at_32_request_boundary() {
+    const RESP: &str = r#"{"choices":[{"message":{"role":"assistant","content":"done"}}]}"#;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(RESP))
+        .mount(&server)
+        .await;
+    let base = format!("{}/v1", server.uri());
+
+    // Exactly 32 counted requests: the every-32nd-request flush fires, so the
+    // count survives a restart WITHOUT any /health read having happened.
+    assert_eq!(
+        requests_carried_after_restart(&base, 32).await,
+        32,
+        "the 32nd counted request must flush totals to disk"
+    );
+
+    // Negative control: 31 requests never cross the boundary (and /health was
+    // never read), so nothing was flushed — the restarted proxy starts fresh.
+    assert_eq!(
+        requests_carried_after_restart(&base, 31).await,
+        0,
+        "below the 32-request boundary nothing is flushed"
+    );
+}
+
+#[tokio::test]
+async fn totals_are_namespaced_per_port() {
+    // Both shipped configs (xAI proxy on 8787, GLM demo on 8788) share the
+    // default cache DB. Totals must be per-port (`totals_json:{port}`) so
+    // concurrent proxies never clobber each other's counts — while the
+    // REWRITE rows stay shared (that sharing is correct and desirable).
+    use prompt_codec::proxy::{create_app_with_state, flush_totals};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg_a = rules_cfg("http://127.0.0.1:9/v1");
+    cfg_a.cache.persist = true;
+    cfg_a.cache.path = Some(dir.path().join("rewrites.sqlite3"));
+    cfg_a.proxy.port = 8787;
+    let mut cfg_b = cfg_a.clone();
+    cfg_b.proxy.port = 8788;
+
+    // Two live instances on the SAME DB record different counts and flush.
+    let (_, state_a) = create_app_with_state(cfg_a.clone(), "a".into());
+    let (_, state_b) = create_app_with_state(cfg_b.clone(), "b".into());
+    state_a.totals.record_request(100, 40);
+    state_b.totals.record_request(200, 90);
+    state_b.totals.record_request(300, 120);
+    flush_totals(&state_a);
+    flush_totals(&state_b);
+
+    // Fresh instances (restart simulation) each reload their OWN count —
+    // neither sees the other's flush.
+    let (_, fresh_a) = create_app_with_state(cfg_a, "a2".into());
+    let (_, fresh_b) = create_app_with_state(cfg_b, "b2".into());
+    let snap_a = fresh_a.totals.snapshot();
+    let snap_b = fresh_b.totals.snapshot();
+    assert_eq!(snap_a.requests, 1, "port 8787 keeps its own request count");
+    assert_eq!(snap_a.before_tokens, 100);
+    assert_eq!(snap_b.requests, 2, "port 8788 keeps its own request count");
+    assert_eq!(snap_b.before_tokens, 500);
+}
+
+// --- Task 3b: Anthropic passthrough + draft dashboard -----------------------
+
+#[tokio::test]
+async fn anthropic_messages_compressed_and_forwarded() {
+    // An Anthropic-shaped upstream reply (content[0].text + a cache-read usage).
+    const RESP: &str = r#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"PONG"}],"usage":{"input_tokens":10,"cache_read_input_tokens":5,"output_tokens":2}}"#;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_string(RESP),
+        )
+        .mount(&server)
+        .await;
+
+    // x_api_key auth style + a unique env var (process-global; parallel tests).
+    let env_name = "PROMPT_CODEC_TEST_ZAI_KEY_MESSAGES";
+    std::env::set_var(env_name, "glm-secret-key");
+    let mut cfg = rules_cfg(&format!("{}/v1", server.uri()));
+    cfg.proxy.upstream_auth_style = "x_api_key".into();
+    cfg.proxy.upstream_api_key_env = env_name.to_string();
+    let proxy = spawn_proxy(cfg).await;
+
+    // The tool_result block must survive byte-identical (never traversed).
+    let tool_result = serde_json::json!({
+        "type": "tool_result",
+        "tool_use_id": "t1",
+        "content": "data"
+    });
+    let client = Client::new();
+    let r = client
+        .post(format!("{proxy}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "glm-5.2",
+            "max_tokens": 64,
+            "system": "keep me",
+            "messages": [
+                {"role": "user", "content": FLUFFY},
+                {"role": "assistant", "content": "Sure, I can help with that."},
+                {"role": "user", "content": [
+                    tool_result,
+                    {"type": "text", "text": FLUFFY}
+                ]}
+            ],
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // Client sees the upstream body verbatim + our stat headers.
+    assert_eq!(r.status().as_u16(), 200);
+    assert!(r.headers().contains_key("x-prompt-codec-before"));
+    assert!(r.headers().contains_key("x-prompt-codec-after"));
+    assert!(r.headers().contains_key("x-prompt-codec-saved-pct"));
+    assert_eq!(
+        r.text().await.unwrap(),
+        RESP,
+        "upstream body byte-identical"
+    );
+
+    // Upstream saw compressed text, an untouched tool_result + system, and the
+    // Anthropic-style auth/version headers.
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let req = &requests[0];
+    assert_eq!(
+        req.headers.get("x-api-key").unwrap().to_str().unwrap(),
+        "glm-secret-key",
+        "env key sent as x-api-key"
+    );
+    assert!(
+        req.headers.contains_key("anthropic-version"),
+        "anthropic-version header forwarded"
+    );
+
+    let sent: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+    let m0 = sent["messages"][0]["content"].as_str().unwrap();
+    assert!(!m0.contains("Thank you"), "string user content compressed");
+    assert!(m0.contains("src/auth.rs"), "real content preserved");
+
+    // tool_result block: deep-equal to the original (byte-identical structure).
+    assert_eq!(
+        sent["messages"][2]["content"][0], tool_result,
+        "tool_result block passed through untouched"
+    );
+    let text_block = sent["messages"][2]["content"][1]["text"].as_str().unwrap();
+    assert!(
+        !text_block.contains("Thank you"),
+        "text content block compressed"
+    );
+    assert!(text_block.contains("src/auth.rs"), "real content preserved");
+
+    // Top-level `system` is left exactly as sent.
+    assert_eq!(sent["system"], "keep me", "system field untouched");
+}
+
+#[tokio::test]
+async fn dashboard_serves_html_and_data() {
+    const RESP: &str = r#"{"choices":[{"message":{"role":"assistant","content":"done"}}]}"#;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(RESP))
+        .mount(&server)
+        .await;
+
+    let proxy = spawn_proxy(rules_cfg(&format!("{}/v1", server.uri()))).await;
+    let client = Client::new();
+
+    // The page is self-contained HTML naming the product.
+    let page = client
+        .get(format!("{proxy}/dashboard"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status().as_u16(), 200);
+    assert!(
+        page.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("text/html"),
+        "dashboard is served as HTML"
+    );
+    assert!(page.text().await.unwrap().contains("prompt-codec"));
+
+    // One compressed request, then the poll feed reflects it.
+    let r = client
+        .post(format!("{proxy}/v1/chat/completions"))
+        .json(&serde_json::json!({"messages": [{"role": "user", "content": FLUFFY}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let _ = r.text().await.unwrap();
+
+    let data: serde_json::Value = client
+        .get(format!("{proxy}/dashboard/data"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(data["totals"]["requests"], 1);
+    assert!(data["totals"]["usd_saved_est"].is_number());
+    let recent = data["recent"].as_array().unwrap();
+    assert_eq!(recent.len(), 1, "one recent request recorded");
+    assert_eq!(recent[0]["endpoint"], "/v1/chat/completions");
+    assert!(recent[0]["before_tokens"].as_u64().unwrap() > 0);
+    assert!(recent[0]["after_tokens"].as_u64().unwrap() > 0);
+    assert!(
+        recent[0]["before_tokens"].as_u64().unwrap() > recent[0]["after_tokens"].as_u64().unwrap(),
+        "rules compression saved tokens"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_is_host_guarded() {
+    // DNS-rebinding pin: the dashboard sits behind the same host guard as the
+    // API routes — a non-loopback Host header is rejected before rendering.
+    let proxy = spawn_proxy(rules_cfg("http://127.0.0.1:9/v1")).await;
+    let client = Client::new();
+    let r = client
+        .get(format!("{proxy}/dashboard"))
+        .header("host", "evil.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 403);
 }

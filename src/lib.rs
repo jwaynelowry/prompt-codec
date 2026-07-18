@@ -6,4 +6,5 @@ pub mod llm;
 pub mod proxy;
 pub mod rules;
 pub mod stats;
+pub mod telemetry;
 pub mod tokenizer;
