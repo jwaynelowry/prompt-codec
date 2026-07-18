@@ -585,4 +585,19 @@ async fn health_reports_without_blocking() {
         body["cache_path"].is_null(),
         "cache_path null when persistence is off"
     );
+    // Default config keeps keep_alive on ("60m") — /health surfaces it.
+    assert_eq!(body["local"]["keep_alive"], "60m");
+}
+
+#[tokio::test]
+async fn health_omits_keep_alive_when_disabled() {
+    let mut cfg = AppConfig::default();
+    cfg.local.base_url = "http://127.0.0.1:1/v1".into();
+    cfg.local.keep_alive = String::new(); // pinning disabled
+    cfg.cache.persist = false;
+    let proxy = spawn_proxy(cfg).await;
+    let client = Client::new();
+    let resp = client.get(format!("{proxy}/health")).send().await.unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["local"]["keep_alive"].is_null());
 }

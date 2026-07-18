@@ -18,6 +18,13 @@ local:
   reasoning_effort: "none"                   # default: "none" — stops thinking models (Gemma 4 etc.) burning
                                              # the output budget on hidden reasoning; "" omits the field for
                                              # servers that reject it
+  # Warm-model keep-alive pinner (v0.3, proxy only, local/hybrid mode only):
+  # pins the model resident via Ollama's native /api/generate call on startup
+  # and every 20 minutes, so hybrid latency stays ~1s instead of paying
+  # Ollama's ~10s cold reload after its default ~5 min idle unload. "" disables
+  # pinning; non-Ollama servers (MLX-LM, Exo) log one warning and stop after
+  # the first failed attempt — never retry-spammed.
+  keep_alive: "60m"                          # default: 60m
 
 encoder:
   # rules  = free deterministic compression only, no model needed

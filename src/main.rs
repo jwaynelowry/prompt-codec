@@ -3,13 +3,14 @@
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use prompt_codec::cli::{read_input, render_savings, Mode};
 use prompt_codec::codec::Codec;
 use prompt_codec::config::resolve_config;
-use prompt_codec::llm::LlmClient;
+use prompt_codec::llm::{keep_alive_loop, LlmClient};
 use prompt_codec::proxy::{cfg_host_is_loopback, create_app};
 use prompt_codec::tokenizer::count_tokens;
 
@@ -229,6 +230,21 @@ async fn main() -> anyhow::Result<()> {
                          rules-only; run: ollama pull {}",
                         cfg.local.model, cfg.encoder.mode, cfg.local.model
                     );
+                }
+
+                // Warm-model keep-alive pinner (v0.3): proxy only, local/hybrid
+                // only — pinning a model `rules` mode never calls would waste
+                // RAM. Built as a separate `LlmClient` (not `Clone`) so it
+                // doesn't disturb the probe above; runs concurrently with
+                // serving and must never delay `axum::serve` below.
+                if !cfg.local.keep_alive.is_empty() {
+                    let pin_llm = LlmClient::new(&cfg.local, cfg.encoder.llm_timeout_s);
+                    let keep_alive = cfg.local.keep_alive.clone();
+                    tokio::spawn(keep_alive_loop(
+                        pin_llm,
+                        keep_alive,
+                        Duration::from_secs(20 * 60),
+                    ));
                 }
             }
 

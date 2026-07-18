@@ -510,7 +510,18 @@ async fn health(State(state): State<Arc<AppState>>) -> Response {
         .cache()
         .disk_path()
         .map(|p| p.display().to_string());
-    let local = serde_json::to_value(state.codec.llm().health().await).unwrap_or(Value::Null);
+    let mut local = serde_json::to_value(state.codec.llm().health().await).unwrap_or(Value::Null);
+    // Display-only: surface the configured keep-alive window (v0.3 warm-model
+    // pinner) in the local section without adding it to `LlmHealth` itself —
+    // it's proxy config, not something the LLM client probes.
+    if !state.cfg.local.keep_alive.is_empty() {
+        if let Value::Object(map) = &mut local {
+            map.insert(
+                "keep_alive".to_string(),
+                Value::String(state.cfg.local.keep_alive.clone()),
+            );
+        }
+    }
     let body = json!({
         "ok": true,
         "encoder_mode": state.cfg.encoder.mode,

@@ -206,6 +206,45 @@ impl LlmClient {
         Ok(content.trim().to_string())
     }
 
+    /// Pin the configured model resident via Ollama's **native**
+    /// `/api/generate` endpoint (never the OpenAI-compatible `/chat/completions`
+    /// path — Ollama's compat layer ignores `keep_alive`, and other servers may
+    /// reject an unknown field). An empty-prompt generate is Ollama's
+    /// documented model-load/pin call: it loads the model if needed and
+    /// returns once resident, with `keep_alive` set to the given window.
+    ///
+    /// Uses a 120 s per-request timeout override — the first pin after a cold
+    /// start may need to load the model — distinct from the process-wide
+    /// `encoder.llm_timeout_s` used for `encode_text`. Any non-2xx status or
+    /// transport error (a non-Ollama server 404ing/refusing the native path)
+    /// is returned as `Err`; callers must not retry-spam on failure.
+    pub async fn pin_model(&self, keep_alive: &str) -> anyhow::Result<()> {
+        // `base_url` is stored trimmed of any trailing '/' (see `new`); Ollama's
+        // OpenAI-compat base ends in `/v1`, but the native API lives one level
+        // up at the server root.
+        let native_base = self.base_url.strip_suffix("/v1").unwrap_or(&self.base_url);
+        let url = format!("{native_base}/api/generate");
+        let payload = serde_json::json!({
+            "model": self.model,
+            "prompt": "",
+            "keep_alive": keep_alive,
+        });
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.api_key)
+            .json(&payload)
+            .timeout(Duration::from_secs(120))
+            .send()
+            .await
+            .context("keep-alive pin request failed")?;
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!("keep-alive pin returned {}", status);
+        }
+        Ok(())
+    }
+
     /// Probe `{base}/models`. Never errors — reachability failures become
     /// `ok: false` with the error text captured. Uses a 3 s per-call timeout
     /// override so `/health` stays responsive even when the process-wide
@@ -257,5 +296,22 @@ impl LlmClient {
                 model_present: None,
             },
         }
+    }
+}
+
+/// Background keep-alive task for the proxy (never spawned for CLI
+/// one-shots, and only when `encoder.mode` is `local`/`hybrid` — see the
+/// proxy startup arm in `main.rs`). Pins the model immediately, then again
+/// every `interval`. On the FIRST failed pin — a non-Ollama server (MLX-LM,
+/// Exo) 404ing or refusing the native endpoint — logs one warning and
+/// returns for good, so a server that will never support this call is never
+/// retry-spammed.
+pub async fn keep_alive_loop(llm: LlmClient, keep_alive: String, interval: Duration) {
+    loop {
+        if let Err(e) = llm.pin_model(&keep_alive).await {
+            tracing::warn!("keep-alive pinning disabled: {e:#}");
+            return;
+        }
+        tokio::time::sleep(interval).await;
     }
 }

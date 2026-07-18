@@ -29,6 +29,11 @@ pub struct LocalConfig {
     /// hidden reasoning and return truncated/empty content. Set to "" if your
     /// OpenAI-compatible server rejects the field.
     pub reasoning_effort: String,
+    /// Keep-alive window sent to Ollama's native `/api/generate` pin call
+    /// (v0.3 warm-model keep-alive pinner) so the model stays resident
+    /// between requests instead of unloading after Ollama's idle default
+    /// (~5 min). `""` disables pinning entirely.
+    pub keep_alive: String,
 }
 
 impl Default for LocalConfig {
@@ -40,6 +45,7 @@ impl Default for LocalConfig {
             temperature: 0.1,
             max_tokens: 2048,
             reasoning_effort: "none".to_string(),
+            keep_alive: "60m".to_string(),
         }
     }
 }
@@ -171,6 +177,7 @@ const KNOWN_SECTIONS: &[(&str, &[&str])] = &[
             "temperature",
             "max_tokens",
             "reasoning_effort",
+            "keep_alive",
         ],
     ),
     (
