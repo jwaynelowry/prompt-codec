@@ -4,7 +4,33 @@
 
 use std::path::PathBuf;
 
+use anyhow::Context;
+
 use crate::stats::TokenStats;
+
+/// Encoder mode selectable from the CLI. clap's `ValueEnum` derive gives
+/// `--mode` its possible-values help text and input validation (a bad value
+/// is a clap usage error, exit code 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Mode {
+    /// Deterministic rules pipeline only (no local model needed)
+    Rules,
+    /// Local-model rewrite only
+    Local,
+    /// Rules first, then local-model rewrite
+    Hybrid,
+}
+
+impl Mode {
+    /// The lowercase name `Codec::encode_text` expects as a mode override.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Rules => "rules",
+            Mode::Local => "local",
+            Mode::Hybrid => "hybrid",
+        }
+    }
+}
 
 /// Resolve the input text for `encode`, in precedence order: `--file` wins
 /// over the positional `text` arg, which wins over piped stdin. Errors when
@@ -16,7 +42,7 @@ pub fn read_input(
 ) -> anyhow::Result<String> {
     if let Some(path) = file {
         return std::fs::read_to_string(&path)
-            .map_err(|e| anyhow::anyhow!("failed to read file {}: {e}", path.display()));
+            .with_context(|| format!("failed to read file {}", path.display()));
     }
     if let Some(t) = text {
         return Ok(t);

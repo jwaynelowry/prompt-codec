@@ -32,6 +32,17 @@ pub struct EncodeResult {
     pub notes: Vec<String>,
 }
 
+/// Result of encoding a single text blob: the compressed text, stats, notes,
+/// and the mode that was actually applied (the override when given, else the
+/// configured `encoder.mode`) — so callers report the truth instead of
+/// re-deriving it.
+pub struct EncodeTextResult {
+    pub text: String,
+    pub stats: TokenStats,
+    pub notes: Vec<String>,
+    pub mode_used: String,
+}
+
 /// Owns the config, the local-LLM client, and the shared rewrite cache. Built
 /// once and reused for the process lifetime; the proxy `AppState` holds one.
 pub struct Codec {
@@ -316,12 +327,9 @@ impl Codec {
     /// Encode a single text blob (CLI `encode`, proxy `/v1/completions`). The
     /// prompt is treated as in-scope/last-user, so it may call the model
     /// directly. `mode_override` lets the CLI force a mode; otherwise the
-    /// configured `encoder.mode` applies.
-    pub async fn encode_text(
-        &self,
-        text: &str,
-        mode_override: Option<&str>,
-    ) -> (String, TokenStats, Vec<String>) {
+    /// configured `encoder.mode` applies. The resolved mode is reported back
+    /// in the result.
+    pub async fn encode_text(&self, text: &str, mode_override: Option<&str>) -> EncodeTextResult {
         let mode = mode_override.unwrap_or(self.cfg.encoder.mode.as_str());
         let mut notes: Vec<String> = Vec::new();
         let before = count_tokens(text);
@@ -373,7 +381,12 @@ impl Codec {
 
         let after = count_tokens(&out);
         let stats = TokenStats::new(before, after, self.cfg.stats.usd_per_mtok_input);
-        (out, stats, notes)
+        EncodeTextResult {
+            text: out,
+            stats,
+            notes,
+            mode_used: mode.to_string(),
+        }
     }
 }
 

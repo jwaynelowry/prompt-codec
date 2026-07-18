@@ -108,7 +108,9 @@ fn is_loopback_name(host: &str) -> bool {
 }
 
 /// Is the *configured* bind host a loopback address (so the guard applies)?
-fn cfg_host_is_loopback(host: &str) -> bool {
+/// `pub` because the CLI's `proxy` command reuses it for its non-loopback bind
+/// warning — one classification, case-insensitive, port-tolerant.
+pub fn cfg_host_is_loopback(host: &str) -> bool {
     is_loopback_name(&normalize_host(host))
 }
 
@@ -415,20 +417,20 @@ async fn completions(State(state): State<Arc<AppState>>, request: Request) -> Re
     };
     let mut extra = Vec::new();
     if let Some(prompt) = prompt {
-        let (encoded, stats, notes) = state.codec.encode_text(&prompt, None).await;
+        let result = state.codec.encode_text(&prompt, None).await;
         if let Some(obj) = payload.as_object_mut() {
-            obj.insert("prompt".to_string(), Value::String(encoded));
+            obj.insert("prompt".to_string(), Value::String(result.text));
         }
         if state.cfg.proxy.log_stats {
             tracing::info!(
-                before = stats.before_tokens,
-                after = stats.after_tokens,
-                pct_saved = stats.pct_saved(),
-                notes = ?notes,
+                before = result.stats.before_tokens,
+                after = result.stats.after_tokens,
+                pct_saved = result.stats.pct_saved(),
+                notes = ?result.notes,
                 "completions encode",
             );
         }
-        extra = stat_headers(&stats);
+        extra = stat_headers(&result.stats);
     }
 
     let new_body = match serde_json::to_vec(&payload) {

@@ -135,15 +135,17 @@ async fn encode_text_blob_accepts_smaller_rewrite() {
         .mount(&server)
         .await;
     let codec = Codec::new(test_cfg(&server.uri()));
-    let (out, stats, notes) = codec
+    let result = codec
         .encode_text(
             "a long and fluffy prompt blob with plenty of words that the local model can shrink",
             None,
         )
         .await;
-    assert_eq!(out, "tiny compressed version");
-    assert!(notes.iter().any(|n| n == "llm_encode"));
-    assert!(stats.after_tokens < stats.before_tokens);
+    assert_eq!(result.text, "tiny compressed version");
+    assert!(result.notes.iter().any(|n| n == "llm_encode"));
+    assert!(result.stats.after_tokens < result.stats.before_tokens);
+    // No override given: the resolved mode is the configured one.
+    assert_eq!(result.mode_used, "hybrid");
 }
 
 #[tokio::test]
@@ -156,11 +158,11 @@ async fn encode_text_blob_rejects_rewrite_not_smaller_than_rules_output() {
         .mount(&server)
         .await;
     let codec = Codec::new(test_cfg(&server.uri()));
-    let (out, _stats, notes) = codec
+    let result = codec
         .encode_text("short-ish blob content for the guard test", None)
         .await;
-    assert!(out.contains("guard test")); // kept the rules output
-    assert!(notes.iter().any(|n| n == "llm_rejected"));
+    assert!(result.text.contains("guard test")); // kept the rules output
+    assert!(result.notes.iter().any(|n| n == "llm_rejected"));
 }
 
 #[tokio::test]

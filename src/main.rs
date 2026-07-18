@@ -4,12 +4,13 @@
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
-use prompt_codec::cli::{read_input, render_savings};
+use prompt_codec::cli::{read_input, render_savings, Mode};
 use prompt_codec::codec::Codec;
 use prompt_codec::config::resolve_config;
 use prompt_codec::llm::LlmClient;
-use prompt_codec::proxy::create_app;
+use prompt_codec::proxy::{cfg_host_is_loopback, create_app};
 use prompt_codec::tokenizer::count_tokens;
 
 #[derive(Parser)]
@@ -23,32 +24,42 @@ struct Cli {
 enum Cmd {
     /// Run the OpenAI-compatible proxy
     Proxy {
+        /// Bind host (overrides proxy.host from config)
         #[arg(long)]
         host: Option<String>,
+        /// Bind port (overrides proxy.port from config)
         #[arg(short, long)]
         port: Option<u16>,
+        /// Path to a config file (default: search chain, then built-in defaults)
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
     /// Compress a prompt (arg, --file, or stdin)
     Encode {
+        /// Prompt text (or use --file / pipe stdin)
         text: Option<String>,
+        /// Read the prompt from a file (wins over the text argument)
         #[arg(short, long)]
         file: Option<PathBuf>,
-        #[arg(short, long)]
-        mode: Option<String>,
+        /// Encoder mode override (default: encoder.mode from config)
+        #[arg(short, long, value_enum)]
+        mode: Option<Mode>,
+        /// Path to a config file (default: search chain, then built-in defaults)
         #[arg(short, long)]
         config: Option<PathBuf>,
+        /// Emit machine-readable JSON ({"text", "stats", "notes"}) on stdout
         #[arg(long)]
         json: bool,
     },
     /// Rules-only demo on a bundled verbose sample
     Demo {
+        /// Path to a config file (default: search chain, then built-in defaults)
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
     /// Check config + local model reachability (exit 1 if local model down)
     Health {
+        /// Path to a config file (default: search chain, then built-in defaults)
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
@@ -125,13 +136,6 @@ async fn main() -> anyhow::Result<()> {
             config,
             json,
         } => {
-            if let Some(m) = mode.as_deref() {
-                if !matches!(m, "rules" | "local" | "hybrid") {
-                    eprintln!("mode must be rules|local|hybrid");
-                    std::process::exit(2);
-                }
-            }
-
             let loaded = resolve_config(config)?;
             print_config_warnings(&loaded.warnings);
 
@@ -139,29 +143,34 @@ async fn main() -> anyhow::Result<()> {
                 if file.is_none() && text.is_none() && !std::io::stdin().is_terminal() {
                     use std::io::Read;
                     let mut buf = String::new();
-                    std::io::stdin().read_to_string(&mut buf)?;
-                    Some(buf)
+                    std::io::stdin()
+                        .read_to_string(&mut buf)
+                        .context("failed to read prompt from stdin")?;
+                    // A 0-byte pipe is "no input", not an empty prompt — let
+                    // read_input produce its proper error.
+                    (!buf.is_empty()).then_some(buf)
                 } else {
                     None
                 };
             let raw = read_input(text, file, stdin_content)?;
 
-            let configured_mode = loaded.config.encoder.mode.clone();
             let codec = Codec::new(loaded.config);
-            let (out, stats, notes) = codec.encode_text(&raw, mode.as_deref()).await;
-            let mode_used = mode.as_deref().unwrap_or(configured_mode.as_str());
+            let result = codec.encode_text(&raw, mode.map(Mode::as_str)).await;
 
             if json {
                 let payload = serde_json::json!({
-                    "text": out,
-                    "stats": stats,
-                    "notes": notes,
+                    "text": result.text,
+                    "stats": result.stats,
+                    "notes": result.notes,
                 });
                 println!("{}", serde_json::to_string_pretty(&payload)?);
             } else {
-                println!("{out}");
+                println!("{}", result.text);
                 println!();
-                println!("{}", render_savings(&stats, mode_used, &notes));
+                println!(
+                    "{}",
+                    render_savings(&result.stats, &result.mode_used, &result.notes)
+                );
             }
         }
 
@@ -171,7 +180,7 @@ async fn main() -> anyhow::Result<()> {
 
             let codec = Codec::new(loaded.config);
             let sample = DEMO_SAMPLE;
-            let (out, stats, _notes) = codec.encode_text(sample, Some("rules")).await;
+            let result = codec.encode_text(sample, Some("rules")).await;
 
             println!("BEFORE (verbose)");
             println!("----------------");
@@ -179,13 +188,13 @@ async fn main() -> anyhow::Result<()> {
             println!();
             println!("AFTER (rules encode)");
             println!("---------------------");
-            println!("{out}");
+            println!("{}", result.text);
             println!();
             println!(
                 "Saved {} tokens ({:.1}%) - est ${:.6}/call",
-                stats.saved_tokens(),
-                stats.pct_saved(),
-                stats.usd_saved()
+                result.stats.saved_tokens(),
+                result.stats.pct_saved(),
+                result.stats.usd_saved()
             );
             println!();
             println!(
@@ -225,7 +234,7 @@ async fn main() -> anyhow::Result<()> {
                 cfg.proxy.port = p;
             }
 
-            if !is_loopback_host(&cfg.proxy.host) {
+            if !cfg_host_is_loopback(&cfg.proxy.host) {
                 eprintln!(
                     "warning: proxy is binding to a non-loopback host ({}); \
                      this proxy has no auth of its own — anything reaching this port \
@@ -245,14 +254,16 @@ async fn main() -> anyhow::Result<()> {
 
             let source = loaded.source.clone();
             let app = create_app(cfg, source);
-            let listener = tokio::net::TcpListener::bind(&addr).await?;
-            axum::serve(listener, app).await?;
+            let listener = tokio::net::TcpListener::bind(&addr)
+                .await
+                .with_context(|| format!("failed to bind {addr}"))?;
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    tokio::signal::ctrl_c().await.ok();
+                })
+                .await?;
         }
     }
 
     Ok(())
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
