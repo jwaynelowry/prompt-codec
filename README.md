@@ -146,6 +146,7 @@ See `config.yaml` (your live config) / `config.example.yaml` (fully commented v2
 | `local.base_url` | `http://127.0.0.1:11434/v1` | OpenAI-compatible local server |
 | `local.api_key` | `ollama` | most local servers ignore this |
 | `local.model` | `gemma4:12b-mlx` | must match `ollama list` / your MLX tag |
+| `local.reasoning_effort` | `none` | stops thinking models burning the output budget on hidden reasoning; `""` omits the field |
 | `local.temperature` | `0.1` | |
 | `local.max_tokens` | `2048` | ceiling; actual budget is sized per call |
 | `encoder.mode` | `hybrid` | `rules` \| `local` \| `hybrid` |

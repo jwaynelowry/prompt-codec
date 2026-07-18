@@ -49,6 +49,45 @@ async fn timeout_is_an_error_not_a_hang() {
 }
 
 #[tokio::test]
+async fn reasoning_effort_sent_by_default_and_omitted_when_empty() {
+    use wiremock::matchers::body_partial_json;
+    // Default config → reasoning_effort: "none" must be in the request body.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(
+            serde_json::json!({"reasoning_effort": "none"}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"content": "compressed output text"}, "finish_reason": "stop"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (c, t) = cfg(&server.uri(), 5.0);
+    LlmClient::new(&c, t).encode_text("x", 0.45).await.unwrap();
+
+    // Empty setting → the field must be absent entirely.
+    let server2 = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"content": "compressed output text"}, "finish_reason": "stop"}]
+        })))
+        .mount(&server2)
+        .await;
+    let (mut c2, t2) = cfg(&server2.uri(), 5.0);
+    c2.reasoning_effort = String::new();
+    LlmClient::new(&c2, t2)
+        .encode_text("x", 0.45)
+        .await
+        .unwrap();
+    let sent = &server2.received_requests().await.unwrap()[0];
+    let body: serde_json::Value = serde_json::from_slice(&sent.body).unwrap();
+    assert!(body.get("reasoning_effort").is_none());
+}
+
+#[tokio::test]
 async fn truncated_output_is_rejected() {
     // finish_reason=length must be an error — a truncated rewrite always "saves
     // tokens" and would otherwise be forwarded with its tail silently dropped.

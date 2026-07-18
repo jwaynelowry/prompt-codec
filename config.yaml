@@ -10,6 +10,10 @@ local:
   model: "gemma4:12b-mlx"
   temperature: 0.1
   max_tokens: 2048
+  # Gemma 4 is a thinking model: without this it spends the whole output
+  # budget on hidden reasoning and every compression fails as truncated.
+  # Set to "" if your server (some MLX/Exo builds) rejects the field.
+  reasoning_effort: "none"
 
 encoder:
   # rules = free, no model | local = LLM rewrite | hybrid = both (recommended)

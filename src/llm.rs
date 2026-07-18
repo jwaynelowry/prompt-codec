@@ -57,6 +57,7 @@ pub struct LlmClient {
     model: String,
     temperature: f64,
     max_tokens: u32,
+    reasoning_effort: String,
 }
 
 #[derive(Deserialize)]
@@ -109,6 +110,7 @@ impl LlmClient {
             model: cfg.model.clone(),
             temperature: cfg.temperature,
             max_tokens: cfg.max_tokens,
+            reasoning_effort: cfg.reasoning_effort.clone(),
         }
     }
 
@@ -134,7 +136,7 @@ impl LlmClient {
         let max_tokens = budget.clamp(256, self.max_tokens.max(256));
 
         let url = format!("{}/chat/completions", self.base_url);
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "model": self.model,
             "messages": [
                 {"role": "system", "content": ENCODE_SYSTEM},
@@ -144,6 +146,13 @@ impl LlmClient {
             "max_tokens": max_tokens,
             "stream": false,
         });
+        // Thinking models (Gemma 4, some Qwen) spend the whole output budget
+        // on hidden reasoning unless told not to; Ollama's OpenAI endpoint
+        // honors reasoning_effort. Omitted when configured empty, for servers
+        // that reject unknown fields.
+        if !self.reasoning_effort.is_empty() {
+            payload["reasoning_effort"] = serde_json::Value::String(self.reasoning_effort.clone());
+        }
 
         let resp = self
             .http

@@ -24,6 +24,11 @@ pub struct LocalConfig {
     pub model: String,
     pub temperature: f64,
     pub max_tokens: u32,
+    /// Sent as `reasoning_effort` on chat requests when non-empty. Thinking
+    /// models (e.g. Gemma 4) otherwise spend the entire output budget on
+    /// hidden reasoning and return truncated/empty content. Set to "" if your
+    /// OpenAI-compatible server rejects the field.
+    pub reasoning_effort: String,
 }
 
 impl Default for LocalConfig {
@@ -34,6 +39,7 @@ impl Default for LocalConfig {
             model: "gemma4:12b-mlx".to_string(),
             temperature: 0.1,
             max_tokens: 2048,
+            reasoning_effort: "none".to_string(),
         }
     }
 }
@@ -143,7 +149,14 @@ pub struct LoadedConfig {
 const KNOWN_SECTIONS: &[(&str, &[&str])] = &[
     (
         "local",
-        &["base_url", "api_key", "model", "temperature", "max_tokens"],
+        &[
+            "base_url",
+            "api_key",
+            "model",
+            "temperature",
+            "max_tokens",
+            "reasoning_effort",
+        ],
     ),
     (
         "encoder",
