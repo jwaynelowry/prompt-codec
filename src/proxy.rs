@@ -35,23 +35,33 @@ pub struct AppState {
     /// Config provenance string, reported verbatim by `/health` (Task 11).
     pub config_source: String,
     pub codec: Codec,
-    /// Upstream HTTP client: a connect timeout but NO total timeout, so long
-    /// streaming responses are never cut off mid-flight.
+    /// Upstream HTTP client: a connect timeout and a per-read (inter-chunk)
+    /// timeout, but NO total timeout — a stalled half-open upstream is bounded
+    /// without ever truncating a long *active* stream.
     pub upstream: reqwest::Client,
+    /// `Bearer {key}` from the env var named by `proxy.upstream_api_key_env`,
+    /// resolved once at startup. `None` when unset/empty.
+    pub env_bearer: Option<HeaderValue>,
 }
 
 /// Build the router. `config_source` is carried into `AppState` for `/health`.
 pub fn create_app(cfg: AppConfig, config_source: String) -> Router {
     let upstream = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
+        .read_timeout(std::time::Duration::from_secs(120))
         .build()
         .expect("failed to build upstream reqwest client");
+    let env_bearer = std::env::var(&cfg.proxy.upstream_api_key_env)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .and_then(|v| HeaderValue::from_str(&format!("Bearer {v}")).ok());
     let codec = Codec::new(cfg.clone());
     let state = Arc::new(AppState {
         cfg,
         config_source,
         codec,
         upstream,
+        env_bearer,
     });
 
     Router::new()
@@ -145,6 +155,23 @@ fn truncate_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
+/// Request-body size cap shared by every read site.
+const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Read a request body up to [`MAX_BODY_BYTES`], or produce the ready-to-return
+/// 413 error response.
+async fn read_body(body: Body) -> Result<Bytes, Response> {
+    axum::body::to_bytes(body, MAX_BODY_BYTES)
+        .await
+        .map_err(|_| {
+            error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "invalid_request_error",
+                "request body too large (max 64MB)",
+            )
+        })
+}
+
 /// The three `x-prompt-codec-*` response headers derived from the compression
 /// stats. `saved-pct` is formatted to one decimal place.
 fn stat_headers(stats: &TokenStats) -> Vec<(HeaderName, HeaderValue)> {
@@ -175,8 +202,12 @@ enum AuthDecision {
 
 /// Resolve the upstream auth per config: reject when required-but-absent; else
 /// forward the client's Authorization when `pass_client_auth`; else fall back
-/// to `Bearer {env}` when the configured env var is non-empty.
-fn resolve_auth(cfg: &ProxyConfig, client_auth: Option<&HeaderValue>) -> AuthDecision {
+/// to the startup-resolved `Bearer {env}` value when present.
+fn resolve_auth(
+    cfg: &ProxyConfig,
+    env_bearer: Option<&HeaderValue>,
+    client_auth: Option<&HeaderValue>,
+) -> AuthDecision {
     if cfg.require_client_auth && client_auth.is_none() {
         return AuthDecision::Reject;
     }
@@ -185,11 +216,8 @@ fn resolve_auth(cfg: &ProxyConfig, client_auth: Option<&HeaderValue>) -> AuthDec
             return AuthDecision::Header(v.clone());
         }
     }
-    let env_val = std::env::var(&cfg.upstream_api_key_env).unwrap_or_default();
-    if !env_val.is_empty() {
-        if let Ok(hv) = HeaderValue::from_str(&format!("Bearer {env_val}")) {
-            return AuthDecision::Header(hv);
-        }
+    if let Some(hv) = env_bearer {
+        return AuthDecision::Header(hv.clone());
     }
     AuthDecision::None
 }
@@ -218,7 +246,10 @@ fn stream_response(resp: reqwest::Response, extra: Vec<(HeaderName, HeaderValue)
         if is_hop_by_hop(name) {
             continue;
         }
-        headers.insert(name.clone(), value.clone());
+        // `append`, not `insert`: repeated upstream headers (Set-Cookie) must
+        // all survive — collapsing to the last value would break verbatim
+        // header passthrough.
+        headers.append(name.clone(), value.clone());
     }
     for (name, value) in extra {
         headers.insert(name, value);
@@ -238,7 +269,11 @@ async fn forward(
     body: Bytes,
     extra: Vec<(HeaderName, HeaderValue)>,
 ) -> Response {
-    let auth = match resolve_auth(&state.cfg.proxy, client_auth.as_ref()) {
+    let auth = match resolve_auth(
+        &state.cfg.proxy,
+        state.env_bearer.as_ref(),
+        client_auth.as_ref(),
+    ) {
         AuthDecision::Reject => {
             return error_response(
                 StatusCode::UNAUTHORIZED,
@@ -261,11 +296,14 @@ async fn forward(
 
     match req.send().await {
         Ok(resp) => stream_response(resp, extra),
-        Err(e) => error_response(
-            StatusCode::BAD_GATEWAY,
-            "upstream_error",
-            &truncate_chars(&e.to_string(), 200),
-        ),
+        Err(e) => {
+            tracing::warn!(error = %e, %url, "upstream request failed");
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                "upstream_error",
+                &truncate_chars(&e.to_string(), 200),
+            )
+        }
     }
 }
 
@@ -285,15 +323,9 @@ async fn chat_completions(State(state): State<Arc<AppState>>, request: Request) 
     let (parts, body) = request.into_parts();
     let client_auth = parts.headers.get(header::AUTHORIZATION).cloned();
 
-    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+    let bytes = match read_body(body).await {
         Ok(b) => b,
-        Err(_) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "failed to read request body",
-            )
-        }
+        Err(resp) => return resp,
     };
     let mut payload: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
@@ -301,12 +333,14 @@ async fn chat_completions(State(state): State<Arc<AppState>>, request: Request) 
             return error_response(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                "messages required",
+                "invalid JSON body",
             )
         }
     };
-    let messages = match payload.get("messages") {
-        Some(Value::Array(a)) if !a.is_empty() => a.clone(),
+    // Move the array out (leaving an empty one behind) rather than deep-cloning
+    // a potentially large message list; the encoded result is inserted back.
+    let messages = match payload.get_mut("messages") {
+        Some(Value::Array(a)) if !a.is_empty() => std::mem::take(a),
         _ => {
             return error_response(
                 StatusCode::BAD_REQUEST,
@@ -360,15 +394,9 @@ async fn completions(State(state): State<Arc<AppState>>, request: Request) -> Re
     let (parts, body) = request.into_parts();
     let client_auth = parts.headers.get(header::AUTHORIZATION).cloned();
 
-    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+    let bytes = match read_body(body).await {
         Ok(b) => b,
-        Err(_) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "failed to read request body",
-            )
-        }
+        Err(resp) => return resp,
     };
     let mut payload: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
@@ -376,7 +404,7 @@ async fn completions(State(state): State<Arc<AppState>>, request: Request) -> Re
             return error_response(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                "invalid request body",
+                "invalid JSON body",
             )
         }
     };
@@ -436,15 +464,9 @@ async fn catch_all(State(state): State<Arc<AppState>>, request: Request) -> Resp
     let content_type = parts.headers.get(header::CONTENT_TYPE).cloned();
     let client_auth = parts.headers.get(header::AUTHORIZATION).cloned();
 
-    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+    let bytes = match read_body(body).await {
         Ok(b) => b,
-        Err(_) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "failed to read request body",
-            )
-        }
+        Err(resp) => return resp,
     };
 
     // Incoming paths are `/v1/...`; the upstream base is the v1 root, so strip

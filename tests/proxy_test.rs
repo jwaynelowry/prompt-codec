@@ -8,10 +8,16 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Spawn the proxy on an ephemeral loopback port and return its base URL.
+/// TCP_NODELAY on accepted connections (the axum-documented `tap_io` pattern)
+/// keeps Nagle/delayed-ACK stalls out of the streaming-latency test.
 async fn spawn_proxy(cfg: AppConfig) -> String {
+    use axum::serve::ListenerExt;
     let app = prompt_codec::proxy::create_app(cfg, "test-config".into());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let listener = listener.tap_io(|tcp_stream| {
+        tcp_stream.set_nodelay(true).ok();
+    });
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     format!("http://{addr}")
 }
@@ -190,7 +196,20 @@ async fn missing_messages_is_400_openai_shape() {
         .unwrap();
     assert_eq!(r.status().as_u16(), 400);
     let body: serde_json::Value = r.json().await.unwrap();
-    assert!(body["error"]["message"].is_string());
+    assert_eq!(body["error"]["message"], "messages required");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+
+    // An unparseable body is distinguished from a missing `messages` key.
+    let r = client
+        .post(format!("{proxy}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body("{not json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 400);
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["error"]["message"], "invalid JSON body");
     assert_eq!(body["error"]["type"], "invalid_request_error");
 }
 
@@ -383,6 +402,101 @@ async fn sse_stream_chunks_pass_through_byte_identical() {
         "SSE content-type preserved"
     );
     assert_eq!(r.text().await.unwrap(), SSE, "SSE body byte-identical");
+}
+
+#[tokio::test]
+async fn streaming_chunks_are_delivered_incrementally() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const CHUNK1: &str = "data: {\"a\":1}\n\n";
+    const CHUNK2: &str = "data: [DONE]\n\n";
+
+    // Progressive delivery is pinned by CAUSALITY, not a wall-clock race
+    // (loopback ACK-timing quirks make sub-second latency assertions flaky):
+    // the hand-rolled upstream (wiremock can't pace chunks) writes the head +
+    // CHUNK1, then refuses to send CHUNK2/EOF until the client has observed
+    // CHUNK1 THROUGH the proxy. A proxy that buffers the upstream body
+    // deadlocks — it won't release CHUNK1 before EOF, and EOF won't happen
+    // before CHUNK1 is seen — so the hard timeout below fails it.
+    let (got_first_tx, got_first_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_base = format!("http://{}/v1", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        sock.set_nodelay(true).unwrap();
+        // Drain the proxy's full request: headers + content-length body.
+        let mut data = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = sock.read(&mut buf).await.unwrap();
+            assert!(n > 0, "proxy closed before sending a full request");
+            data.extend_from_slice(&buf[..n]);
+            if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&data[..pos]).to_string();
+                let content_length = head
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        if k.eq_ignore_ascii_case("content-length") {
+                            v.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                if data.len() >= pos + 4 + content_length {
+                    break;
+                }
+            }
+        }
+        // No content-length/transfer-encoding: the body is EOF-terminated,
+        // so nothing downstream can know the size and pre-buffer honestly.
+        sock.write_all(
+            b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        sock.write_all(CHUNK1.as_bytes()).await.unwrap();
+        sock.flush().await.unwrap();
+        // Hold the stream open until the client proves CHUNK1 got through.
+        got_first_rx.await.unwrap();
+        sock.write_all(CHUNK2.as_bytes()).await.unwrap();
+        sock.flush().await.unwrap();
+        // dropping the socket sends EOF, terminating the body
+    });
+
+    let proxy = spawn_proxy(rules_cfg(&upstream_base)).await;
+    let client = Client::new();
+    let received = tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+        let mut resp = client
+            .post(format!("{proxy}/v1/chat/completions"))
+            .json(&serde_json::json!({
+                "stream": true,
+                "messages": [{"role": "user", "content": "hello world here friend"}],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        // First chunk received while the upstream stream is still open —
+        // release the rest of the stream only now.
+        let first = resp.chunk().await.unwrap().expect("first chunk");
+        got_first_tx.send(()).unwrap();
+        let mut received = first.to_vec();
+        while let Some(chunk) = resp.chunk().await.unwrap() {
+            received.extend_from_slice(&chunk);
+        }
+        received
+    })
+    .await
+    .expect("timed out waiting for the first chunk: the proxy buffers the stream");
+
+    assert_eq!(
+        String::from_utf8(received).unwrap(),
+        format!("{CHUNK1}{CHUNK2}"),
+        "full stream must be byte-identical"
+    );
 }
 
 #[tokio::test]
