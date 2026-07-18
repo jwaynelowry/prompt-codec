@@ -98,16 +98,24 @@ when `cache.persist: false`):
 }
 ```
 
+Totals are **per proxy port** (`totals_json:{port}` in the meta table), so
+concurrent proxies sharing one cache DB — e.g. the xAI proxy on 8787 and the
+GLM demo on 8788 — keep independent counts, while the rewrite rows themselves
+stay shared across all instances.
+
 `upstream_cached_tokens` is **best-effort**: the proxy taps only the last 16 KB
-of each `/v1/chat/completions` and `/v1/completions` response (bytes forwarded
-unchanged, no full-body buffering) and regex-scans that tail for the provider's
-prompt-cache usage — both OpenAI (`cached_tokens`) and Anthropic/Z.ai
-(`cache_read_input_tokens`) shapes. Non-streaming responses always carry it;
-streaming responses only when the client requested `stream_options.include_usage`.
-When the tail has no usage block, nothing is recorded — the counter simply
-doesn't grow. Totals are flushed on every `/health` read, every 32 counted
-requests, and at graceful (ctrl-c) shutdown; a hard kill may lose the last few
-requests' counting.
+of each `/v1/chat/completions`, `/v1/completions`, and `/v1/messages` response
+(bytes forwarded unchanged, no full-body buffering) and regex-scans that tail
+for the provider's prompt-cache usage — both OpenAI (`cached_tokens`) and
+Anthropic/Z.ai (`cache_read_input_tokens`) shapes. Non-streaming responses
+always carry it; OpenAI-style streaming responses only when the client
+requested `stream_options.include_usage`, and Anthropic-style streams usually
+report usage in the `message_start` event at the **head** of the stream, which
+can fall outside the 16 KB tail ring on long replies. When the tail has no
+usage block, nothing is recorded — the counter simply doesn't grow. Totals are
+flushed on every `/health` read, every 32 counted requests, and at graceful
+(SIGINT/SIGTERM) shutdown; a hard kill may lose the last few requests'
+counting.
 
 ### GLM demo + dashboard (draft, new in v0.3)
 

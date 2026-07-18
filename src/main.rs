@@ -256,12 +256,29 @@ async fn main() -> anyhow::Result<()> {
                 .with_context(|| format!("failed to bind {addr}"))?;
             axum::serve(listener, app)
                 .with_graceful_shutdown(async {
+                    // Both polite shutdown paths release serve so the totals
+                    // flush below runs: ctrl-c (SIGINT) AND `kill <pid>`/launchd
+                    // (SIGTERM). SIGKILL still loses the tail — accepted.
+                    #[cfg(unix)]
+                    {
+                        use tokio::signal::unix::{signal, SignalKind};
+                        match signal(SignalKind::terminate()) {
+                            Ok(mut term) => tokio::select! {
+                                _ = tokio::signal::ctrl_c() => {}
+                                _ = term.recv() => {}
+                            },
+                            Err(_) => {
+                                tokio::signal::ctrl_c().await.ok();
+                            }
+                        }
+                    }
+                    #[cfg(not(unix))]
                     tokio::signal::ctrl_c().await.ok();
                 })
                 .await?;
-            // Graceful-shutdown (ctrl-c) flush: persist the final savings totals
-            // so the next process picks them up. A hard kill may lose the last
-            // few requests' counting — accepted per spec.
+            // Graceful-shutdown (SIGINT/SIGTERM) flush: persist the final
+            // savings totals so the next process picks them up. A hard kill may
+            // lose the last few requests' counting — accepted per spec.
             flush_totals(&state);
         }
     }

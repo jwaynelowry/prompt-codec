@@ -92,6 +92,16 @@ pub struct RecentEntry {
     pub llm_used: bool,
 }
 
+/// Per-instance meta key for the persisted totals row, namespaced by the
+/// configured proxy port. Both shipped configs (xAI on 8787, the GLM demo on
+/// 8788) share the default cache DB; without the namespace each proxy would
+/// load and overwrite the SAME row — concurrent proxies silently erasing each
+/// other's lifetime counts (last flush wins). Rewrite-row sharing across
+/// proxies is untouched: that sharing is correct and desirable.
+fn totals_meta_key(port: u16) -> String {
+    format!("totals_json:{port}")
+}
+
 /// Flush the current totals snapshot to the cache `meta` table. A no-op when
 /// the cache has no disk tier (`cache.persist = false`), so it is always safe
 /// to call. Serialization failure is swallowed — telemetry never fails a
@@ -105,7 +115,10 @@ pub fn flush_totals(state: &AppState) {
 /// atomics twice.
 fn flush_snapshot(state: &AppState, snap: &TotalsSnapshot) {
     if let Ok(json) = serde_json::to_string(snap) {
-        state.codec.cache().meta_set("totals_json", &json);
+        state
+            .codec
+            .cache()
+            .meta_set(&totals_meta_key(state.cfg.proxy.port), &json);
     }
 }
 
@@ -137,10 +150,13 @@ pub fn create_app_with_state(cfg: AppConfig, config_source: String) -> (Router, 
         .as_deref()
         .and_then(|v| HeaderValue::from_str(v).ok());
     let codec = Codec::new(cfg.clone());
-    // Lifetime totals: load a prior `totals_json` row (absent/corrupt → fresh,
-    // warned inside `Totals::load`). Without a disk tier `meta_get` is `None`,
-    // so totals are session-only with `since = process start`.
-    let totals = Arc::new(Totals::load(codec.cache().meta_get("totals_json")));
+    // Lifetime totals: load this instance's port-namespaced `totals_json:{port}`
+    // row (absent/corrupt → fresh, warned inside `Totals::load`). Without a
+    // disk tier `meta_get` is `None`, so totals are session-only with
+    // `since = process start`.
+    let totals = Arc::new(Totals::load(
+        codec.cache().meta_get(&totals_meta_key(cfg.proxy.port)),
+    ));
     let state = Arc::new(AppState {
         cfg,
         config_source,

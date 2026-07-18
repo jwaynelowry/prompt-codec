@@ -791,6 +791,43 @@ async fn totals_flush_at_32_request_boundary() {
     );
 }
 
+#[tokio::test]
+async fn totals_are_namespaced_per_port() {
+    // Both shipped configs (xAI proxy on 8787, GLM demo on 8788) share the
+    // default cache DB. Totals must be per-port (`totals_json:{port}`) so
+    // concurrent proxies never clobber each other's counts — while the
+    // REWRITE rows stay shared (that sharing is correct and desirable).
+    use prompt_codec::proxy::{create_app_with_state, flush_totals};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg_a = rules_cfg("http://127.0.0.1:9/v1");
+    cfg_a.cache.persist = true;
+    cfg_a.cache.path = Some(dir.path().join("rewrites.sqlite3"));
+    cfg_a.proxy.port = 8787;
+    let mut cfg_b = cfg_a.clone();
+    cfg_b.proxy.port = 8788;
+
+    // Two live instances on the SAME DB record different counts and flush.
+    let (_, state_a) = create_app_with_state(cfg_a.clone(), "a".into());
+    let (_, state_b) = create_app_with_state(cfg_b.clone(), "b".into());
+    state_a.totals.record_request(100, 40);
+    state_b.totals.record_request(200, 90);
+    state_b.totals.record_request(300, 120);
+    flush_totals(&state_a);
+    flush_totals(&state_b);
+
+    // Fresh instances (restart simulation) each reload their OWN count —
+    // neither sees the other's flush.
+    let (_, fresh_a) = create_app_with_state(cfg_a, "a2".into());
+    let (_, fresh_b) = create_app_with_state(cfg_b, "b2".into());
+    let snap_a = fresh_a.totals.snapshot();
+    let snap_b = fresh_b.totals.snapshot();
+    assert_eq!(snap_a.requests, 1, "port 8787 keeps its own request count");
+    assert_eq!(snap_a.before_tokens, 100);
+    assert_eq!(snap_b.requests, 2, "port 8788 keeps its own request count");
+    assert_eq!(snap_b.before_tokens, 500);
+}
+
 // --- Task 3b: Anthropic passthrough + draft dashboard -----------------------
 
 #[tokio::test]
@@ -950,4 +987,19 @@ async fn dashboard_serves_html_and_data() {
         recent[0]["before_tokens"].as_u64().unwrap() > recent[0]["after_tokens"].as_u64().unwrap(),
         "rules compression saved tokens"
     );
+}
+
+#[tokio::test]
+async fn dashboard_is_host_guarded() {
+    // DNS-rebinding pin: the dashboard sits behind the same host guard as the
+    // API routes — a non-loopback Host header is rejected before rendering.
+    let proxy = spawn_proxy(rules_cfg("http://127.0.0.1:9/v1")).await;
+    let client = Client::new();
+    let r = client
+        .get(format!("{proxy}/dashboard"))
+        .header("host", "evil.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 403);
 }
