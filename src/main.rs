@@ -110,6 +110,9 @@ async fn main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        // Logs go to stderr: stdout is reserved for command output so that
+        // `encode --json | jq`-style pipes always receive clean JSON.
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
