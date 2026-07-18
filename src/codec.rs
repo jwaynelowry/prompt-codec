@@ -17,7 +17,7 @@
 
 use serde_json::Value;
 
-use crate::cache::RewriteCache;
+use crate::cache::{resolve_cache_path, DiskCacheConfig, RewriteCache};
 use crate::config::{AppConfig, LlmScope};
 use crate::llm::LlmClient;
 use crate::rules::{collapse_whitespace, rules_compress};
@@ -148,7 +148,13 @@ fn accept_rewrite(rewrite: &str, baseline: &str) -> bool {
 impl Codec {
     pub fn new(cfg: AppConfig) -> Self {
         let llm = LlmClient::new(&cfg.local, cfg.encoder.llm_timeout_s);
-        let cache = RewriteCache::new(cfg.cache.max_entries);
+        // Build the durable tier only when persistence is on; a broken/absent
+        // DB degrades to memory-only inside `new_with_disk` (never fails here).
+        let disk = cfg.cache.persist.then(|| DiskCacheConfig {
+            path: resolve_cache_path(cfg.cache.path.clone()),
+            max_disk_entries: cfg.cache.max_disk_entries,
+        });
+        let cache = RewriteCache::new_with_disk(cfg.cache.max_entries, disk);
         Self { cfg, llm, cache }
     }
 

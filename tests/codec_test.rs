@@ -13,10 +13,56 @@ fn test_cfg(llm_base: &str) -> AppConfig {
     c.local.base_url = format!("{llm_base}/v1");
     c.encoder.min_chars_to_compress = 10;
     c.encoder.mode = "hybrid".into();
+    // Hermetic: never touch the user's real cache dir. Tests that specifically
+    // exercise the disk tier opt back in with a tempdir path.
+    c.cache.persist = false;
     c
 }
 fn long_user(text: &str) -> serde_json::Value {
     json!({"role": "user", "content": text})
+}
+
+#[tokio::test]
+async fn disk_cache_survives_codec_rebuild() {
+    // A rewrite accepted by Codec A (fresh memory tier) must be served by a
+    // REBUILT Codec B sharing the same on-disk DB — with zero further LLM calls.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "tiny compressed version"}, "finish_reason": "stop"}]})))
+        .expect(1) // the ONE LLM call is A's miss; B must hit the disk cache.
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_cfg(&server.uri());
+    cfg.cache.persist = true;
+    cfg.cache.path = Some(dir.path().join("rewrites.sqlite3"));
+
+    let msg = "first long message needing compression right here with plenty of words to shrink";
+
+    {
+        let codec_a = Codec::new(cfg.clone());
+        let r1 = codec_a.encode_messages(vec![long_user(msg)]).await;
+        assert_eq!(
+            r1.messages[0]["content"].as_str().unwrap(),
+            "tiny compressed version"
+        );
+    } // drop A: its in-memory tier is gone; only the disk row remains.
+
+    let codec_b = Codec::new(cfg);
+    let r2 = codec_b.encode_messages(vec![long_user(msg)]).await;
+    assert_eq!(
+        r2.messages[0]["content"].as_str().unwrap(),
+        "tiny compressed version"
+    );
+    assert!(
+        r2.notes.iter().any(|n| n.starts_with("cache_hit")),
+        "B must serve the rewrite from the shared disk cache; notes={:?}",
+        r2.notes
+    );
+    // wiremock's .expect(1) is verified on server drop: a 2nd LLM call panics.
 }
 
 #[tokio::test]

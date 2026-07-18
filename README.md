@@ -157,7 +157,10 @@ See `config.yaml` (your live config) / `config.example.yaml` (fully commented v2
 | `encoder.llm_scope` **(new)** | `last_user` | `last_user` \| `all` \| `none` — see above |
 | `encoder.llm_timeout_s` **(new)** | `15` | hard per-call timeout, seconds |
 | `encoder.list_trim_enabled` **(new)** | `false` | reserved, no-op today |
-| `cache.max_entries` **(new)** | `4096` | LRU accepted-rewrite cache size |
+| `cache.max_entries` **(new)** | `4096` | in-memory LRU accepted-rewrite cache size |
+| `cache.persist` **(new in v0.3)** | `true` | enable the durable SQLite tier (rewrites survive restarts, shared with CLI one-shots); `false` = memory-only. A broken disk degrades to memory-only with one warning |
+| `cache.path` **(new in v0.3)** | platform cache dir | override the SQLite DB location; default `~/Library/Caches/prompt-codec/rewrites.sqlite3` on macOS (falls back to `./prompt-codec-cache.sqlite3`) |
+| `cache.max_disk_entries` **(new in v0.3)** | `100000` | disk-tier prune threshold (oldest-by-last-used evicted first) |
 | `proxy.host` / `proxy.port` | `127.0.0.1` / `8787` | |
 | `proxy.upstream_base_url` | `https://api.x.ai/v1` | your paid provider |
 | `proxy.upstream_api_key_env` | `X_API_KEY` | env var holding the key — never hardcode it |

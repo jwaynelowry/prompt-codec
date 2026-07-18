@@ -502,6 +502,14 @@ async fn health(State(state): State<Arc<AppState>>) -> Response {
     // Flush moka's pending write accounting so the count is accurate.
     state.codec.cache().sync();
     let cache_entries = state.codec.cache().entry_count();
+    // Durable tier: entry count is None when persistence is off or the disk
+    // cache is broken; path is None unless a durable tier is active.
+    let cache_disk_entries = state.codec.cache().disk_entry_count();
+    let cache_path = state
+        .codec
+        .cache()
+        .disk_path()
+        .map(|p| p.display().to_string());
     let local = serde_json::to_value(state.codec.llm().health().await).unwrap_or(Value::Null);
     let body = json!({
         "ok": true,
@@ -509,6 +517,8 @@ async fn health(State(state): State<Arc<AppState>>) -> Response {
         "upstream": state.cfg.proxy.upstream_base_url,
         "config_source": state.config_source,
         "cache_entries": cache_entries,
+        "cache_disk_entries": cache_disk_entries,
+        "cache_path": cache_path,
         "local": local,
     });
     (StatusCode::OK, Json(body)).into_response()

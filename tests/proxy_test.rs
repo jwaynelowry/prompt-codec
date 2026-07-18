@@ -30,6 +30,8 @@ fn rules_cfg(upstream_base: &str) -> AppConfig {
     let mut cfg = AppConfig::default();
     cfg.encoder.mode = "rules".into(); // deterministic, no local LLM needed
     cfg.proxy.upstream_base_url = upstream_base.to_string();
+    // Hermetic: never touch the user's real cache dir during tests.
+    cfg.cache.persist = false;
     cfg
 }
 
@@ -555,6 +557,7 @@ async fn streaming_chunks_are_delivered_incrementally() {
 async fn health_reports_without_blocking() {
     let mut cfg = AppConfig::default();
     cfg.local.base_url = "http://127.0.0.1:1/v1".into(); // unreachable local LLM
+    cfg.cache.persist = false; // hermetic: no real cache dir in tests
     let proxy = spawn_proxy(cfg).await;
     let client = Client::new();
 
@@ -573,4 +576,13 @@ async fn health_reports_without_blocking() {
     );
     assert_eq!(body["config_source"], "test-config");
     assert!(body["cache_entries"].is_number());
+    // Persistence is off in this test: the disk tier fields report absence.
+    assert!(
+        body["cache_disk_entries"].is_null(),
+        "disk entries null when persistence is off"
+    );
+    assert!(
+        body["cache_path"].is_null(),
+        "cache_path null when persistence is off"
+    );
 }

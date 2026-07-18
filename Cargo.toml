@@ -12,6 +12,7 @@ hex = "0.4.3"
 moka = { version = "0.12.15", features = ["sync"] }
 regex = "1.13.1"
 reqwest = { version = "0.13.4", features = ["json", "stream"] }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["preserve_order"] }
 serde_yaml = "0.9.34"

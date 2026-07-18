@@ -54,9 +54,25 @@ encoder:
   list_trim_enabled: false                   # default: false
 
 cache:
-  # Max accepted-rewrite cache entries (LRU eviction beyond this bound).
-  # Keyed on sha256(model|target_ratio|content), shared by the CLI and proxy.
+  # Max in-memory accepted-rewrite cache entries (LRU eviction beyond this
+  # bound). Keyed on sha256(model|target_ratio|content), shared by CLI & proxy.
   max_entries: 4096                          # default: 4096
+
+  # Persistent (SQLite) cache tier: accepted rewrites survive proxy restarts
+  # and are shared with CLI one-shots, so compressed history stays byte-stable
+  # across restarts (protecting upstream prompt-cache discounts) and no
+  # compression is ever paid for twice. false = v0.2 memory-only behavior.
+  # A broken/unwritable DB degrades to memory-only with a single warning.
+  persist: true                              # default: true
+
+  # Override the SQLite DB location. Omit to use the platform cache dir:
+  #   macOS: ~/Library/Caches/prompt-codec/rewrites.sqlite3
+  # (falls back to ./prompt-codec-cache.sqlite3 if no cache dir resolves).
+  # path: "/custom/path/rewrites.sqlite3"    # default: platform cache dir
+
+  # Prune the disk tier back toward this many rows once it grows past the cap
+  # (oldest-by-last-used evicted first).
+  max_disk_entries: 100000                   # default: 100000
 
 proxy:
   host: "127.0.0.1"                          # default: 127.0.0.1

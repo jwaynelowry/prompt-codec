@@ -76,11 +76,26 @@ impl Default for EncoderConfig {
 #[serde(default)]
 pub struct CacheConfig {
     pub max_entries: u64,
+    /// Enable the durable SQLite tier (v0.3). `false` restores v0.2
+    /// memory-only behavior — nothing is ever written to disk.
+    pub persist: bool,
+    /// Override the SQLite DB location. `None` resolves to
+    /// `dirs::cache_dir()/prompt-codec/rewrites.sqlite3` (falling back to
+    /// `./prompt-codec-cache.sqlite3` when no cache dir resolves).
+    pub path: Option<PathBuf>,
+    /// Prune the disk tier back toward this many rows (oldest-by-`last_used`
+    /// evicted first) once it grows past the cap.
+    pub max_disk_entries: u64,
 }
 
 impl Default for CacheConfig {
     fn default() -> Self {
-        Self { max_entries: 4096 }
+        Self {
+            max_entries: 4096,
+            persist: true,
+            path: None,
+            max_disk_entries: 100_000,
+        }
     }
 }
 
@@ -171,7 +186,10 @@ const KNOWN_SECTIONS: &[(&str, &[&str])] = &[
             "list_trim_enabled",
         ],
     ),
-    ("cache", &["max_entries"]),
+    (
+        "cache",
+        &["max_entries", "persist", "path", "max_disk_entries"],
+    ),
     (
         "proxy",
         &[
