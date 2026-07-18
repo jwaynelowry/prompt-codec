@@ -4,8 +4,10 @@
 local:
   base_url: "http://127.0.0.1:11434/v1"
   api_key: "ollama"
-  # gemma4:12b-mlx does not exist; use a tag from `ollama list` (or your MLX/Exo tag)
-  model: "gemma3:4b"
+  # Gemma 4 (released 2026-04) — 12b-mlx: 7.7GB, 256K context, MLX-optimized;
+  # Ollama 0.31+ multi-token prediction makes it fast on Apple Silicon.
+  # Lighter: qwen3.5:4b-mlx (4GB). Stronger: gemma4:26b-mlx (18GB, MoE, 3.8B active).
+  model: "gemma4:12b-mlx"
   temperature: 0.1
   max_tokens: 2048
 

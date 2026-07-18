@@ -9,3 +9,4 @@ target/
 # Added by cargo
 
 /target
+.firecrawl/
