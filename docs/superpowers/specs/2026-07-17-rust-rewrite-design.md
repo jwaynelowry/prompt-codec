@@ -105,12 +105,15 @@ Prose-only transforms, in order:
 
 Long-list trimming (v1's `compress_long_lists`) is **off by default**
 (`encoder.list_trim_enabled: false`) — it deletes data from tool output.
+The knob is reserved/no-op in v2: enabling it warns at config load and has no effect.
 
 Invariants (unit + property tested):
 - All fenced code is byte-identical after compression (except whole-duplicate
   removal).
 - Idempotent: `rules(rules(x)) == rules(x)`.
-- Never returns empty output for non-empty input.
+- Never returns empty output for input with real (non-boilerplate) content.
+  Pure-fluff input ("Thank you!") may compress to empty; the codec layer keeps
+  the original content whenever rules would empty a message entirely.
 
 ### codec — compression policy
 
@@ -124,6 +127,8 @@ Per message role:
 - Content that is an array of parts: transform only `{"type":"text"}` parts;
   all other fields of every message (`tool_calls`, `tool_call_id`, `name`, …)
   pass through untouched.
+
+Mode `local` bypasses the rules stage entirely (matching v1 semantics): the per-role transforms above — including tool JSON minify — run only when the rules stage runs (modes `rules`/`hybrid` with `rules_enabled`).
 
 LLM pass (mode `hybrid` or `local`):
 - Scope: `encoder.llm_scope: last_user` (default) — only the final `user`

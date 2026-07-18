@@ -1239,3 +1239,31 @@ Run it; paste the table into the README's "v2 vs v1" note. Expect Rust ≥ Pytho
 - [ ] **Step 3:** Latency check (acceptance §5): `time` 20 sequential `encode --mode rules` runs on `tests/corpus/code_heavy.md`; p50 per-call must be < 5 ms of codec work (measure via the CLI's `--json` timing or a `#[bench]`-style test with `std::time::Instant` in a `--release` test).
 - [ ] **Step 4:** Confirm acceptance criteria 1–6 from the spec one by one; record results in the plan file under this task.
 - [ ] **Step 5:** Final commit `chore: v0.2.0 — Rust rewrite complete`; leave `legacy/` in place per spec (user deletes when satisfied).
+
+---
+
+## Task 14 results (2026-07-17)
+
+End-to-end acceptance verification of the six spec criteria. Evidence gathered
+against the release binary (`target/release/prompt-codec`), a python3 mock
+upstream that records each request body byte-exact, and temporary `--release`
+Rust harnesses (deleted after use; working tree left clean — only this plan file
+changed). No version bump performed here (final review + `v0.2.0` cutover follow).
+
+| # | Criterion | Method | Result | Verdict |
+|---|-----------|--------|--------|---------|
+| 1 | `cargo test` green; `cargo clippy --all-targets -- -D warnings` clean | Ran both on the clean committed tree | `cargo test`: **86 passed, 0 failed** (56 lib + 9 codec_test + 4 golden_test + 5 llm_test + 12 proxy_test). Clippy: **0 warnings, exit 0** (fresh recompile). | **PASS** |
+| 2 | Code-heavy prompt: all fenced blocks byte-identical through `encode` AND the proxy | `encode --mode rules` on `tests/corpus/code_heavy.md`; and live POST of the same corpus (as a user message) through the proxy → python mock. Temp Rust harness used the real `rules::segment` to extract the 3 unique fence bodies and assert containment in both the encode output and the recorded upstream body. | All **3 unique fence bodies** (python, js, diff; the duplicate js fence collapses to first-seen) byte-identical through `encode` AND through the recorded proxy→upstream body. `metadata` not injected; `model`/`temperature` preserved; fluff stripped. | **PASS** |
+| 3 | Same conversation twice through the proxy: identical compressed history bytes; zero repeat local-LLM calls | POSTed the identical chat body twice through the rules-mode proxy; compared the two recorded upstream bodies. | Recorded bodies **byte-identical** (both 3469 B, sha256 `ff2e1e56…`, `cmp` clean); response `x-prompt-codec-*` headers identical (987→781, 20.9%) across both sends. Rules mode issues **zero** local-LLM calls (`/health` `cache_entries` stayed 0). **Hybrid/Ollama variant NOT RUN**: Ollama up at 127.0.0.1:11434 but **no models installed** (`gemma3:4b` absent — `/api/tags` empty, `/v1/models` `data:null`); precondition unmet. | **PASS** (rules leg; hybrid variant skipped) |
+| 4 | Upstream 401 → client 401 | Cited `tests/proxy_test.rs::upstream_401_and_429_reach_client_unchanged` (passing in §1; covers 401+429 verbatim, one shared streaming/non-streaming path). Live: python mock returning 401 behind a second proxy instance. | Client received **401 Unauthorized** with the mock's error body **byte-identical**. | **PASS** |
+| 5 | Rules-path codec overhead p50 < 5 ms on ~10 KB prompt | `--release` bench: 3× `code_heavy.md` = **12006 B / 2943 tokens**; 10-iter warmup, then 100 samples of the proxy's per-request work (`count_tokens` + `rules_compress` + `count_tokens`). No process/BPE-load in the timed region. | **p50 = 0.99 ms** (p90 1.04, min 0.96, max 1.24, mean 1.00) — well under 5 ms. | **PASS** |
+| 6 | Demo savings + stats surfacing (headers + log line) | `cargo run --release -- demo`; and inspected §2 proxy responses + logs. | Demo: `Saved 80 tokens (31.4%) - est $0.000240/call`. Proxy responses carried `x-prompt-codec-before/after/saved-pct`; proxy logged `chat_completions encode before=987 after=781 pct_saved=20.87…` per request. | **PASS** |
+
+Additional smoke (plan Step 2): live `proxy` startup emitted the config-source
+log line (`loaded config source=…/config_ok.yaml`) and `/health` returned valid
+JSON (`ok:true`, `encoder_mode:rules`, correct `config_source`/`upstream`,
+`cache_entries:0`).
+
+**Overall: 6/6 PASS.** Sole caveat: the optional hybrid-mode determinism variant
+(criterion 3) could not run because no local Ollama model (`gemma3:4b`) is
+installed; the required rules-mode determinism leg passed.

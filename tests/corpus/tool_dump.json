@@ -1,0 +1,113 @@
+Tool call dump from the coding agent's last turn — raw output of the file-search tool, captured verbatim for the transcript.
+
+```json
+{
+  "tool": "file_search",
+  "status": "success",
+  "request": {
+    "query": "authentication session token rotation",
+    "max_results": 8,
+    "filters": {
+      "path_prefix": "src/auth",
+      "extensions": [
+        ".py",
+        ".ts"
+      ]
+    }
+  },
+  "results": [
+    {
+      "path": "src/auth/session.py",
+      "score": 0.94,
+      "matches": [
+        {
+          "line": 42,
+          "text": "def rotate_refresh_token(token, family_id):"
+        },
+        {
+          "line": 43,
+          "text": "    please validate family_id before rotating"
+        }
+      ]
+    },
+    {
+      "path": "src/auth/tokens.py",
+      "score": 0.81,
+      "matches": [
+        {
+          "line": 10,
+          "text": "class TokenRotationError(Exception):"
+        }
+      ]
+    },
+    {
+      "path": "src/auth/middleware.py",
+      "score": 0.77,
+      "matches": [
+        {
+          "line": 5,
+          "text": "def require_session(handler):"
+        },
+        {
+          "line": 6,
+          "text": "    please double check the redirect target"
+        }
+      ]
+    },
+    {
+      "path": "src/auth/redis_store.py",
+      "score": 0.63,
+      "matches": [
+        {
+          "line": 21,
+          "text": "SESSION_PREFIX = 'sess:'"
+        }
+      ]
+    },
+    {
+      "path": "src/auth/jwt_utils.py",
+      "score": 0.58,
+      "matches": [
+        {
+          "line": 8,
+          "text": "def decode_jwt(token, secret):"
+        },
+        {
+          "line": 33,
+          "text": "    thank you for keeping this function pure"
+        }
+      ]
+    },
+    {
+      "path": "tests/auth/test_session.py",
+      "score": 0.51,
+      "matches": [
+        {
+          "line": 15,
+          "text": "def test_rotation_invalidates_old_family():"
+        }
+      ]
+    }
+  ],
+  "notes": [
+    "please double check the family invalidation logic",
+    "thank you for running this search",
+    "please re-run once the fixture data is refreshed"
+  ],
+  "diagnostics": {
+    "elapsed_ms": 128,
+    "index_version": "2024.03.1",
+    "warnings": [],
+    "cache": {
+      "hit": false,
+      "backend": "sqlite",
+      "entries": 4096,
+      "stats": {
+        "hits": 1203,
+        "misses": 87
+      }
+    }
+  },
+  "raw_stdout": "Searching index...\nFound 6 matches.\nplease wait, thank you for your patience\nDone.\n"
+}
+```

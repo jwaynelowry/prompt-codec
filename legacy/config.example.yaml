@@ -1,0 +1,54 @@
+# Copy to config.yaml and edit.
+# Local model does the encode/decode; paid API only sees the compressed prompt.
+
+local:
+  # OpenAI-compatible base URL for your free local model
+  # Examples:
+  #   Ollama:  http://127.0.0.1:11434/v1
+  #   MLX-LM:  http://127.0.0.1:8080/v1
+  #   Exo:     http://127.0.0.1:52415/v1
+  base_url: "http://127.0.0.1:11434/v1"
+  api_key: "ollama"
+  model: "gemma4:12b-mlx"   # change to whatever `ollama list` / mlx shows
+  timeout_s: 120
+  temperature: 0.1
+  max_tokens: 2048
+
+encoder:
+  # rules | local | hybrid
+  # rules  = free deterministic compression (no model needed)
+  # local  = rewrite via local LLM only
+  # hybrid = rules first, then local LLM refine (best savings)
+  mode: hybrid
+  # Target ratio of original size (approx). 0.4 = aim for ~40% of input tokens.
+  target_ratio: 0.45
+  # Never touch system messages shorter than this (chars)
+  protect_system_under_chars: 800
+  # Only compress user/system content longer than this (chars)
+  min_chars_to_compress: 400
+  # Drop consecutive duplicate lines, collapse whitespace, strip boilerplate
+  rules_enabled: true
+  # Roles the encoder rewrites: user, system, tool (assistant left alone by default)
+  roles: ["user", "system", "tool"]
+
+decoder:
+  enabled: false
+  mode: "off"   # "local" | "off"  (quote off — YAML treats bare off as false)
+
+proxy:
+  host: "127.0.0.1"
+  port: 8787
+  # Where compressed requests are forwarded (paid API)
+  upstream_base_url: "https://api.x.ai/v1"
+  # Env var name holding the upstream API key (never hardcode secrets here)
+  upstream_api_key_env: "X_API_KEY"
+  # Also accept Authorization header from client and pass-through if set
+  pass_client_auth: true
+  # Log before/after token counts to stdout
+  log_stats: true
+
+stats:
+  # Approximate tokenizer for cost estimates (cl100k_base ≈ GPT-4/xAI ballpark)
+  encoding: "cl100k_base"
+  # Optional $ per 1M input tokens for rough savings display (xAI/Grok-ish placeholder)
+  usd_per_mtok_input: 3.0
