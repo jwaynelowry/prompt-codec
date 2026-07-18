@@ -13,7 +13,9 @@
 //!   header isn't itself loopback are rejected 403 — a malicious web page can't
 //!   drive the localhost proxy and spend the user's upstream API key.
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
@@ -22,11 +24,15 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
+use futures_core::Stream;
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::codec::Codec;
 use crate::config::{AppConfig, ProxyConfig};
+use crate::llm::LlmHealth;
 use crate::stats::TokenStats;
+use crate::telemetry::{extract_cached_tokens, TailBuffer, Totals};
 
 /// Shared proxy state, built once in [`create_app`] and reused for the process
 /// lifetime behind an `Arc`.
@@ -42,10 +48,32 @@ pub struct AppState {
     /// `Bearer {key}` from the env var named by `proxy.upstream_api_key_env`,
     /// resolved once at startup. `None` when unset/empty.
     pub env_bearer: Option<HeaderValue>,
+    /// Cumulative savings telemetry (v0.3 Feature 3): atomic counters loaded
+    /// from the cache `meta` table at startup and flushed back on `/health`,
+    /// every 32 counted requests, and at graceful shutdown.
+    pub totals: Arc<Totals>,
+}
+
+/// Flush the current totals snapshot to the cache `meta` table. A no-op when
+/// the cache has no disk tier (`cache.persist = false`), so it is always safe
+/// to call. Serialization failure is swallowed — telemetry never fails a
+/// request or shutdown.
+pub fn flush_totals(state: &AppState) {
+    if let Ok(json) = serde_json::to_string(&state.totals.snapshot()) {
+        state.codec.cache().meta_set("totals_json", &json);
+    }
 }
 
 /// Build the router. `config_source` is carried into `AppState` for `/health`.
+/// Thin wrapper over [`create_app_with_state`] for callers/tests that don't
+/// need the shared state handle.
 pub fn create_app(cfg: AppConfig, config_source: String) -> Router {
+    create_app_with_state(cfg, config_source).0
+}
+
+/// Build the router AND return the shared [`AppState`] handle, so `main` can
+/// flush telemetry after `axum::serve` returns on the graceful-shutdown path.
+pub fn create_app_with_state(cfg: AppConfig, config_source: String) -> (Router, Arc<AppState>) {
     let upstream = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .read_timeout(std::time::Duration::from_secs(120))
@@ -56,15 +84,20 @@ pub fn create_app(cfg: AppConfig, config_source: String) -> Router {
         .filter(|v| !v.is_empty())
         .and_then(|v| HeaderValue::from_str(&format!("Bearer {v}")).ok());
     let codec = Codec::new(cfg.clone());
+    // Lifetime totals: load a prior `totals_json` row (absent/corrupt → fresh,
+    // warned inside `Totals::load`). Without a disk tier `meta_get` is `None`,
+    // so totals are session-only with `since = process start`.
+    let totals = Arc::new(Totals::load(codec.cache().meta_get("totals_json")));
     let state = Arc::new(AppState {
         cfg,
         config_source,
         codec,
         upstream,
         env_bearer,
+        totals,
     });
 
-    Router::new()
+    let router = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/health", get(health))
@@ -74,7 +107,8 @@ pub fn create_app(cfg: AppConfig, config_source: String) -> Router {
             state.clone(),
             host_guard,
         ))
-        .with_state(state)
+        .with_state(state.clone());
+    (router, state)
 }
 
 // --- DNS-rebinding host guard ------------------------------------------------
@@ -234,14 +268,93 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
         || *name == header::CONTENT_LENGTH
 }
 
+/// Pass-through response-body inspector for the compressing routes: it forwards
+/// every chunk BYTE-FOR-BYTE while copying the trailing 16 KB into a
+/// [`TailBuffer`]. On stream end — the final `poll_next` returning `None`, or a
+/// drop if the client disconnects early — it scans the tail once for an upstream
+/// cached-token count and folds it into the shared totals. No body buffering, no
+/// added latency: the existing SSE byte-identity and causality tests are the
+/// guard that this adds zero distortion.
+struct InspectStream {
+    inner: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>,
+    tail: TailBuffer,
+    totals: Arc<Totals>,
+    finalized: bool,
+}
+
+impl InspectStream {
+    fn new(
+        inner: impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
+        totals: Arc<Totals>,
+    ) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            tail: TailBuffer::new(),
+            totals,
+            finalized: false,
+        }
+    }
+
+    /// Run the tail scan exactly once (idempotent across a final poll + drop).
+    fn finalize(&mut self) {
+        if self.finalized {
+            return;
+        }
+        self.finalized = true;
+        if let Some(cached) = extract_cached_tokens(self.tail.as_bytes()) {
+            self.totals.record_cache_info(cached);
+        }
+    }
+}
+
+impl Stream for InspectStream {
+    type Item = reqwest::Result<Bytes>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // `InspectStream` is `Unpin` (every field is), so `get_mut` is sound.
+        let this = self.get_mut();
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(bytes))) => {
+                this.tail.push(&bytes);
+                Poll::Ready(Some(Ok(bytes)))
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(None) => {
+                this.finalize();
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for InspectStream {
+    fn drop(&mut self) {
+        // Early client disconnect: still scan whatever tail we captured.
+        self.finalize();
+    }
+}
+
 /// Turn an upstream `reqwest::Response` into an axum `Response`, copying status
 /// and (non-hop-by-hop) headers and streaming the body verbatim. `extra`
 /// headers (the `x-prompt-codec-*` set) are appended for the compressing routes.
-fn stream_response(resp: reqwest::Response, extra: Vec<(HeaderName, HeaderValue)>) -> Response {
+/// When `inspect` is `Some`, the body stream is wrapped in an [`InspectStream`]
+/// that captures upstream cached-token usage without altering the bytes.
+fn stream_response(
+    resp: reqwest::Response,
+    extra: Vec<(HeaderName, HeaderValue)>,
+    inspect: Option<Arc<Totals>>,
+) -> Response {
     let status = resp.status();
     let src_headers = resp.headers().clone();
     // ONE body path for streaming and non-streaming: bytes pass through verbatim.
-    let mut response = Response::new(Body::from_stream(resp.bytes_stream()));
+    // The inspector, when present, is a transparent tap — it never rewrites,
+    // reorders, or withholds a chunk.
+    let body = match inspect {
+        Some(totals) => Body::from_stream(InspectStream::new(resp.bytes_stream(), totals)),
+        None => Body::from_stream(resp.bytes_stream()),
+    };
+    let mut response = Response::new(body);
     *response.status_mut() = status;
     let headers = response.headers_mut();
     for (name, value) in src_headers.iter() {
@@ -261,7 +374,13 @@ fn stream_response(resp: reqwest::Response, extra: Vec<(HeaderName, HeaderValue)
 
 /// Send `body` upstream to `url` with the given method, optional content-type,
 /// and resolved auth; stream the reply back. The single forward path used by
-/// the chat, completions, and catch-all routes.
+/// the chat, completions, and catch-all routes. `inspect` carries the totals
+/// handle for the compressing routes (tail cached-token capture); the catch-all
+/// passes `None`, so its traffic is never touched.
+// The arg list is the request shape for the ONE shared forward path — keeping
+// them positional (rather than a params struct) preserves the verbatim
+// passthrough design and each call site reads as a plain forward.
+#[allow(clippy::too_many_arguments)]
 async fn forward(
     state: &AppState,
     method: Method,
@@ -270,6 +389,7 @@ async fn forward(
     client_auth: Option<HeaderValue>,
     body: Bytes,
     extra: Vec<(HeaderName, HeaderValue)>,
+    inspect: Option<Arc<Totals>>,
 ) -> Response {
     let auth = match resolve_auth(
         &state.cfg.proxy,
@@ -297,7 +417,7 @@ async fn forward(
     req = req.body(body);
 
     match req.send().await {
-        Ok(resp) => stream_response(resp, extra),
+        Ok(resp) => stream_response(resp, extra, inspect),
         Err(e) => {
             tracing::warn!(error = %e, %url, "upstream request failed");
             error_response(
@@ -365,6 +485,8 @@ async fn chat_completions(State(state): State<Arc<AppState>>, request: Request) 
             "chat_completions encode",
         );
     }
+    // Telemetry: a valid messages array always produces stats here, so count it.
+    record_and_maybe_flush(&state, &result.stats);
 
     let new_body = match serde_json::to_vec(&payload) {
         Ok(b) => Bytes::from(b),
@@ -384,8 +506,21 @@ async fn chat_completions(State(state): State<Arc<AppState>>, request: Request) 
         client_auth,
         new_body,
         stat_headers(&result.stats),
+        Some(state.totals.clone()),
     )
     .await
+}
+
+/// Fold one compressed request's stats into the totals and, on every 32nd
+/// counted request, flush them to the cache `meta` table. Shared by the two
+/// compressing handlers (chat + completions).
+fn record_and_maybe_flush(state: &AppState, stats: &TokenStats) {
+    let n = state
+        .totals
+        .record_request(stats.before_tokens as u64, stats.after_tokens as u64);
+    if n.is_multiple_of(32) {
+        flush_totals(state);
+    }
 }
 
 // --- Completions -------------------------------------------------------------
@@ -430,6 +565,9 @@ async fn completions(State(state): State<Arc<AppState>>, request: Request) -> Re
                 "completions encode",
             );
         }
+        // Telemetry: only a non-empty string prompt produces stats (a missing
+        // or non-string `prompt` is a passthrough and must not be counted).
+        record_and_maybe_flush(&state, &result.stats);
         extra = stat_headers(&result.stats);
     }
 
@@ -443,6 +581,9 @@ async fn completions(State(state): State<Arc<AppState>>, request: Request) -> Re
             )
         }
     };
+    // Inspect the response only when we actually compressed (stats produced);
+    // an uncompressed passthrough completion is not telemetry-counted.
+    let inspect = (!extra.is_empty()).then(|| state.totals.clone());
     forward(
         &state,
         Method::POST,
@@ -451,6 +592,7 @@ async fn completions(State(state): State<Arc<AppState>>, request: Request) -> Re
         client_auth,
         new_body,
         extra,
+        inspect,
     )
     .await
 }
@@ -490,15 +632,33 @@ async fn catch_all(State(state): State<Arc<AppState>>, request: Request) -> Resp
         client_auth,
         bytes,
         Vec::new(),
+        None, // catch-all traffic is never inspected or counted
     )
     .await
 }
 
 // --- Health ------------------------------------------------------------------
 
-/// `GET /health`: encoder/upstream/config provenance, live cache size, and a
-/// non-blocking local-LLM reachability probe. Never fails.
+/// The local-LLM section of `/health`: the probed [`LlmHealth`] flattened
+/// together with the display-only configured keep-alive window (v0.3 warm-model
+/// pinner). A typed wrapper — rather than a raw `serde_json::Value` mutation —
+/// so the merged field names are compiler-checked.
+#[derive(Serialize)]
+struct LocalHealth {
+    #[serde(flatten)]
+    health: LlmHealth,
+    /// Present only when pinning is configured on; `None` omits the key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keep_alive: Option<String>,
+}
+
+/// `GET /health`: encoder/upstream/config provenance, live cache size, savings
+/// totals, and a non-blocking local-LLM reachability probe. Never fails.
 async fn health(State(state): State<Arc<AppState>>) -> Response {
+    // Persist the current totals so a subsequent restart carries them over
+    // (the primary flush trigger the restart path relies on).
+    flush_totals(&state);
+
     // Flush moka's pending write accounting so the count is accurate.
     state.codec.cache().sync();
     let cache_entries = state.codec.cache().entry_count();
@@ -510,18 +670,30 @@ async fn health(State(state): State<Arc<AppState>>) -> Response {
         .cache()
         .disk_path()
         .map(|p| p.display().to_string());
-    let mut local = serde_json::to_value(state.codec.llm().health().await).unwrap_or(Value::Null);
-    // Display-only: surface the configured keep-alive window (v0.3 warm-model
-    // pinner) in the local section without adding it to `LlmHealth` itself —
-    // it's proxy config, not something the LLM client probes.
-    if !state.cfg.local.keep_alive.is_empty() {
-        if let Value::Object(map) = &mut local {
-            map.insert(
-                "keep_alive".to_string(),
-                Value::String(state.cfg.local.keep_alive.clone()),
-            );
-        }
-    }
+    // Display-only: surface the configured keep-alive window without adding it
+    // to `LlmHealth` itself — it's proxy config, not something the LLM probes.
+    let local = LocalHealth {
+        health: state.codec.llm().health().await,
+        keep_alive: (!state.cfg.local.keep_alive.is_empty())
+            .then(|| state.cfg.local.keep_alive.clone()),
+    };
+    let local = serde_json::to_value(local).unwrap_or(Value::Null);
+
+    // Savings telemetry (v0.3 Feature 3): raw counters plus derived
+    // saved_tokens / est_usd_saved.
+    let t = state.totals.snapshot();
+    let usd = state.cfg.stats.usd_per_mtok_input;
+    let totals = json!({
+        "requests": t.requests,
+        "before_tokens": t.before_tokens,
+        "after_tokens": t.after_tokens,
+        "saved_tokens": t.saved_tokens(),
+        "est_usd_saved": round6(t.est_usd_saved(usd)),
+        "upstream_cached_tokens": t.upstream_cached_tokens,
+        "responses_with_cache_info": t.responses_with_cache_info,
+        "since": t.since,
+    });
+
     let body = json!({
         "ok": true,
         "encoder_mode": state.cfg.encoder.mode,
@@ -531,8 +703,15 @@ async fn health(State(state): State<Arc<AppState>>) -> Response {
         "cache_disk_entries": cache_disk_entries,
         "cache_path": cache_path,
         "local": local,
+        "totals": totals,
     });
     (StatusCode::OK, Json(body)).into_response()
+}
+
+/// Round to 6 decimal places — matches the `usd_saved_est` precision used
+/// elsewhere (stats.rs), keeping tiny demo-scale savings visible.
+fn round6(x: f64) -> f64 {
+    (x * 1_000_000.0).round() / 1_000_000.0
 }
 
 #[cfg(test)]

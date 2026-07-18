@@ -1313,6 +1313,7 @@ dependencies = [
  "axum",
  "clap",
  "dirs",
+ "futures-core",
  "hex",
  "moka",
  "proptest",

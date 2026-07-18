@@ -10,7 +10,7 @@ use prompt_codec::cli::{read_input, render_savings, Mode};
 use prompt_codec::codec::Codec;
 use prompt_codec::config::resolve_config;
 use prompt_codec::llm::{keep_alive_loop, repin_interval, LlmClient};
-use prompt_codec::proxy::{cfg_host_is_loopback, create_app};
+use prompt_codec::proxy::{cfg_host_is_loopback, create_app_with_state, flush_totals};
 use prompt_codec::tokenizer::count_tokens;
 
 #[derive(Parser)]
@@ -250,7 +250,7 @@ async fn main() -> anyhow::Result<()> {
             println!("Upstream base: {}", cfg.proxy.upstream_base_url);
 
             let source = loaded.source.clone();
-            let app = create_app(cfg, source);
+            let (app, state) = create_app_with_state(cfg, source);
             let listener = tokio::net::TcpListener::bind(&addr)
                 .await
                 .with_context(|| format!("failed to bind {addr}"))?;
@@ -259,6 +259,10 @@ async fn main() -> anyhow::Result<()> {
                     tokio::signal::ctrl_c().await.ok();
                 })
                 .await?;
+            // Graceful-shutdown (ctrl-c) flush: persist the final savings totals
+            // so the next process picks them up. A hard kill may lose the last
+            // few requests' counting — accepted per spec.
+            flush_totals(&state);
         }
     }
 

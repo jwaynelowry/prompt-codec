@@ -79,6 +79,36 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   -d '{"model":"grok-4.5","messages":[{"role":"user","content":"…long prompt…"}]}'
 ```
 
+### Savings telemetry (`GET /health`, new in v0.3)
+
+`/health` reports a cumulative `totals` object across the proxy's lifetime,
+persisted in the SQLite cache `meta` table (survives restarts; session-only
+when `cache.persist: false`):
+
+```json
+"totals": {
+  "requests": 1234,               // requests that produced compression stats
+  "before_tokens": 5678901,
+  "after_tokens": 3456789,
+  "saved_tokens": 2222112,        // derived: before − after (clamped at 0)
+  "est_usd_saved": 6.666336,      // saved / 1e6 × stats.usd_per_mtok_input
+  "upstream_cached_tokens": 890123,
+  "responses_with_cache_info": 1100,
+  "since": "2026-07-18T17:00:00Z" // when the totals row was first created
+}
+```
+
+`upstream_cached_tokens` is **best-effort**: the proxy taps only the last 16 KB
+of each `/v1/chat/completions` and `/v1/completions` response (bytes forwarded
+unchanged, no full-body buffering) and regex-scans that tail for the provider's
+prompt-cache usage — both OpenAI (`cached_tokens`) and Anthropic/Z.ai
+(`cache_read_input_tokens`) shapes. Non-streaming responses always carry it;
+streaming responses only when the client requested `stream_options.include_usage`.
+When the tail has no usage block, nothing is recorded — the counter simply
+doesn't grow. Totals are flushed on every `/health` read, every 32 counted
+requests, and at graceful (ctrl-c) shutdown; a hard kill may lose the last few
+requests' counting.
+
 ### Hermes wiring
 
 In `~/.hermes/config.yaml` (or a custom provider), add a provider that hits the proxy:

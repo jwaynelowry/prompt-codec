@@ -601,3 +601,122 @@ async fn health_omits_keep_alive_when_disabled() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert!(body["local"]["keep_alive"].is_null());
 }
+
+// --- Task 3: savings telemetry ----------------------------------------------
+
+#[tokio::test]
+async fn health_totals_accumulate() {
+    // Upstream body carries an OpenAI usage block with a cached-token count; the
+    // tail inspector must capture it without altering the forwarded bytes.
+    const RESP: &str = r#"{"id":"chatcmpl-x","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"done"}}],"usage":{"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":40}}}"#;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_string(RESP),
+        )
+        .mount(&server)
+        .await;
+
+    let proxy = spawn_proxy(rules_cfg(&format!("{}/v1", server.uri()))).await;
+    let client = Client::new();
+    for _ in 0..2 {
+        let r = client
+            .post(format!("{proxy}/v1/chat/completions"))
+            .json(&serde_json::json!({"messages": [{"role": "user", "content": FLUFFY}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        // Drain the full body so the inspector reaches stream-end and folds in
+        // the cached-token count before we read /health.
+        assert_eq!(
+            r.text().await.unwrap(),
+            RESP,
+            "body forwarded byte-identical"
+        );
+    }
+
+    let health: serde_json::Value = client
+        .get(format!("{proxy}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let t = &health["totals"];
+    assert_eq!(t["requests"], 2, "two compressed requests counted");
+    assert!(
+        t["saved_tokens"].as_u64().unwrap() > 0,
+        "rules compression saved tokens"
+    );
+    assert!(t["before_tokens"].as_u64().unwrap() > t["after_tokens"].as_u64().unwrap());
+    assert_eq!(
+        t["upstream_cached_tokens"], 80,
+        "40 cached tokens × 2 responses"
+    );
+    assert_eq!(t["responses_with_cache_info"], 2);
+    assert!(t["since"].as_str().unwrap().ends_with('Z'), "RFC3339 since");
+}
+
+#[tokio::test]
+async fn totals_survive_restart() {
+    const RESP: &str = r#"{"choices":[{"message":{"role":"assistant","content":"done"}}]}"#;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(RESP))
+        .mount(&server)
+        .await;
+
+    // Persist ON, on an isolated tempdir cache path (never the user's real dir).
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = rules_cfg(&format!("{}/v1", server.uri()));
+    cfg.cache.persist = true;
+    cfg.cache.path = Some(dir.path().join("rewrites.sqlite3"));
+
+    // Proxy A: one compressed request, then GET /health to flush totals to disk.
+    let proxy_a = spawn_proxy(cfg.clone()).await;
+    let client = Client::new();
+    let r = client
+        .post(format!("{proxy_a}/v1/chat/completions"))
+        .json(&serde_json::json!({"messages": [{"role": "user", "content": FLUFFY}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let _ = r.text().await.unwrap();
+    let health_a: serde_json::Value = client
+        .get(format!("{proxy_a}/health")) // /health flushes totals_json
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(health_a["totals"]["requests"], 1);
+
+    // Proxy B: fresh process state, SAME cache path — totals carry over.
+    let proxy_b = spawn_proxy(cfg).await;
+    let health_b: serde_json::Value = client
+        .get(format!("{proxy_b}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        health_b["totals"]["requests"].as_u64().unwrap() >= 1,
+        "restarted proxy carried over the prior request count"
+    );
+    // `since` is the ORIGINAL creation stamp, preserved across the restart.
+    assert_eq!(
+        health_b["totals"]["since"], health_a["totals"]["since"],
+        "since is preserved across restart, not reset"
+    );
+}
