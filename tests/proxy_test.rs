@@ -185,6 +185,58 @@ async fn client_auth_passthrough_and_env_key_fallback() {
 }
 
 #[tokio::test]
+async fn require_client_auth_gates_unauthenticated_requests() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+    let mut cfg = rules_cfg(&format!("{}/v1", server.uri()));
+    cfg.proxy.require_client_auth = true;
+    let proxy = spawn_proxy(cfg).await;
+    let client = Client::new();
+
+    // (a) No Authorization -> 401 in the OpenAI shape, upstream never touched.
+    let r = client
+        .post(format!("{proxy}/v1/chat/completions"))
+        .json(&serde_json::json!({"messages": [{"role": "user", "content": "hello world here"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 401);
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "authentication_error");
+    assert!(body["error"]["message"].is_string());
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        0,
+        "unauthenticated request must never reach upstream"
+    );
+
+    // (b) With Authorization -> forwarded normally.
+    let r = client
+        .post(format!("{proxy}/v1/chat/completions"))
+        .header("authorization", "Bearer gate-key")
+        .json(&serde_json::json!({"messages": [{"role": "user", "content": "hello world here"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "Bearer gate-key"
+    );
+}
+
+#[tokio::test]
 async fn missing_messages_is_400_openai_shape() {
     let proxy = spawn_proxy(rules_cfg("http://127.0.0.1:9/v1")).await;
     let client = Client::new();

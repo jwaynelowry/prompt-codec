@@ -85,6 +85,32 @@ async fn health_model_present_is_none_for_unexpected_body_shape() {
 }
 
 #[tokio::test]
+async fn health_data_null_is_an_empty_listing() {
+    // Ollama with zero pulled models returns {"data": null}: a real, reachable
+    // listing that simply has no models -> model_present Some(false), so the
+    // proxy can warn that hybrid will degrade to rules-only.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": null})))
+        .mount(&server)
+        .await;
+    let (c, t) = cfg(&server.uri(), 5.0);
+    let h = LlmClient::new(&c, t).health().await;
+    assert!(h.ok);
+    assert_eq!(h.model_present, Some(false));
+}
+
+#[tokio::test]
+async fn invalid_timeout_values_do_not_panic() {
+    // A hand-edited YAML can hold NaN/negative/overflowing timeout values;
+    // client construction must clamp instead of panicking at startup.
+    for bad in [f64::NAN, f64::INFINITY, -3.0, 0.0, 1e300] {
+        let _ = LlmClient::new(&LocalConfig::default(), bad);
+    }
+}
+
+#[tokio::test]
 async fn health_probe_reports_ok_model_presence_and_down() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

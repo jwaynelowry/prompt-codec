@@ -251,6 +251,13 @@ pub fn load_config_from(path: &Path) -> anyhow::Result<LoadedConfig> {
     let value = sanitize(value, &mut warnings);
     let config: AppConfig = serde_yaml::from_value(value)
         .with_context(|| format!("failed to load config: {}", path.display()))?;
+    // Known-but-unimplemented knob: accepted so v1 configs load cleanly, but
+    // the user deserves to know it does nothing.
+    if config.encoder.list_trim_enabled {
+        warnings.push(
+            "encoder.list_trim_enabled is reserved and not implemented in v2; ignored".to_string(),
+        );
+    }
     Ok(LoadedConfig {
         config,
         source: path.display().to_string(),
@@ -353,6 +360,23 @@ mod tests {
         let loaded = resolve_config_with_candidates(None, &[]).unwrap();
         assert_eq!(loaded.source, "built-in defaults");
         assert_eq!(loaded.config.local.model, "gemma3:4b");
+    }
+
+    #[test]
+    fn enabling_reserved_list_trim_knob_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.yaml");
+        std::fs::write(&p, "encoder:\n  list_trim_enabled: true\n").unwrap();
+        let loaded = load_config_from(&p).unwrap();
+        assert!(loaded.config.encoder.list_trim_enabled); // still deserializes
+        assert!(loaded
+            .warnings
+            .join("\n")
+            .contains("encoder.list_trim_enabled is reserved and not implemented in v2; ignored"));
+        // The default (false) stays quiet.
+        std::fs::write(&p, "encoder:\n  list_trim_enabled: false\n").unwrap();
+        let loaded = load_config_from(&p).unwrap();
+        assert!(loaded.warnings.is_empty());
     }
 
     #[test]

@@ -339,11 +339,14 @@ impl Codec {
         if apply_rules {
             let compressed = rules_compress(&out);
             if !out.trim().is_empty() && compressed.trim().is_empty() {
+                // Pure-fluff input: keep the original bytes and note ONLY the
+                // restore — mirroring encode_messages' rules_emptied marker
+                // (a rules_compress note here would contradict it).
                 notes.push("rules_emptied".to_string());
             } else {
                 out = compressed;
+                notes.push("rules_compress".to_string());
             }
-            notes.push("rules_compress".to_string());
         }
 
         let do_llm =

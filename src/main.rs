@@ -209,6 +209,22 @@ async fn main() -> anyhow::Result<()> {
             // Load the BPE table now, not on the first request.
             count_tokens("warmup");
 
+            // Visibility, not a gate: in local/hybrid mode a missing local
+            // model silently degrades every request to rules-only, so say so
+            // loudly up front. The probe has its own 3s timeout; startup
+            // proceeds regardless of the outcome.
+            if matches!(cfg.encoder.mode.as_str(), "local" | "hybrid") {
+                let llm = LlmClient::new(&cfg.local, cfg.encoder.llm_timeout_s);
+                let h = llm.health().await;
+                if !h.ok || h.model_present == Some(false) {
+                    eprintln!(
+                        "warning: local model '{}' unavailable — {} mode will degrade to \
+                         rules-only; run: ollama pull {}",
+                        cfg.local.model, cfg.encoder.mode, cfg.local.model
+                    );
+                }
+            }
+
             let addr = format!("{}:{}", cfg.proxy.host, cfg.proxy.port);
             println!("Starting Prompt Codec proxy...");
             println!("Listening on http://{addr}/v1 (OpenAI-compatible)");

@@ -84,8 +84,22 @@ fn truncate_chars(s: &str, max: usize) -> String {
 
 impl LlmClient {
     pub fn new(cfg: &LocalConfig, timeout_s: f64) -> Self {
+        // A hand-edited YAML can hold NaN/negative/overflowing values, and
+        // `Duration::from_secs_f64` panics on those — guard so a bad
+        // `encoder.llm_timeout_s` can't take down startup. Zero is treated as
+        // invalid too (it would fail every request instantly).
+        let timeout = Duration::try_from_secs_f64(timeout_s)
+            .ok()
+            .filter(|d| !d.is_zero())
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    configured = timeout_s,
+                    "invalid encoder.llm_timeout_s; clamping to 1s"
+                );
+                Duration::from_secs(1)
+            });
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs_f64(timeout_s))
+            .timeout(timeout)
             .build()
             .expect("failed to build reqwest client");
         Self {
@@ -195,20 +209,20 @@ impl LlmClient {
             Ok(resp) => {
                 let status = resp.status();
                 // `Some(...)` only when the body is a genuine OpenAI models
-                // listing — a JSON object with a `data` array. Anything else
-                // (non-JSON, `{"error": ...}`, exotic MLX shapes) is `None`,
-                // never a false `Some(false)`.
+                // listing — a JSON object with a `data` key. A `data` array is
+                // checked for the configured model; `data: null` (Ollama with
+                // zero pulled models) is a real, empty listing -> Some(false).
+                // Anything else (non-JSON, `{"error": ...}`, exotic MLX
+                // shapes) is `None`, never a false `Some(false)`.
                 let model_present = match resp.json::<serde_json::Value>().await {
-                    Ok(body) => {
-                        body.get("data")
-                            .and_then(serde_json::Value::as_array)
-                            .map(|models| {
-                                models.iter().any(|m| {
-                                    m.get("id").and_then(serde_json::Value::as_str)
-                                        == Some(self.model.as_str())
-                                })
-                            })
-                    }
+                    Ok(body) => match body.get("data") {
+                        Some(serde_json::Value::Array(models)) => Some(models.iter().any(|m| {
+                            m.get("id").and_then(serde_json::Value::as_str)
+                                == Some(self.model.as_str())
+                        })),
+                        Some(serde_json::Value::Null) => Some(false),
+                        _ => None,
+                    },
                     Err(_) => None,
                 };
                 LlmHealth {
