@@ -28,10 +28,25 @@ migration branch in `DiskTier::open`):
 - `requests(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, port INTEGER,
   route TEXT, model TEXT, before_tokens INTEGER, after_tokens INTEGER,
   source TEXT CHECK(source IN ('llm','cache','rules')), duration_ms INTEGER,
-  upstream_cached INTEGER, before_text TEXT, after_text TEXT)` — one row per
-  compressed request, written best-effort after the compression stage
-  (before/after text per Wayne's approval; `model` from the request body's
-  model field when present).
+  upstream_cached INTEGER, before_text TEXT, after_text TEXT,
+  text_truncated INTEGER)` — one row per compressed request.
+  **Write timing (deferred to stream end):** the handler packages a pending
+  row (ts, port, route, model, token counts, source, capped texts, and a
+  start `Instant`) into the existing `InspectStream`; `finalize()` — which
+  already runs exactly once at stream end or drop — completes it with
+  `duration_ms` (**total time to stream end**, matching the approved
+  preview's "served in …" meta line) and `upstream_cached` from the tail
+  scan, then fires the INSERT and the hourly UPSERT best-effort. When
+  `forward()` fails before any stream exists, the row is written at the
+  error site with `upstream_cached` NULL and duration-to-error.
+  **Text fields:** NOT raw request JSON — the before/after values of exactly
+  the segments the codec transformed (the prompt string, or the user text
+  blocks/strings it touched), joined with `\n\n---\n\n` when multiple; each
+  field capped at 64 KB with `text_truncated=1` when clipped (keeps the
+  synchronous INSERT within the accepted small-write budget).
+  **`source` precedence** (one request may hit several paths across its
+  messages): any `llm_encode` note → `llm`; else any `cache_hit` → `cache`;
+  else `rules`.
   Cap: `dashboard.max_history` (default 5000) rows per DB, pruned
   oldest-first with the same probabilistic + capped-delete pattern as
   rewrites pruning.
@@ -43,17 +58,26 @@ migration branch in `DiskTier::open`):
 All writes are fire-and-forget on the existing degrade path (a broken disk
 loses history, never a request). When `cache.persist: false`, history and
 charts are session-only-empty (documented); the in-memory recent ring
-(cap raised to 50) still feeds the table view.
+(cap raised to 50) still feeds the table view. **Unified recent shape:** ring
+entries gain the same fields the table needs (`id: Option<i64>` — Some only
+when a DB row was written — plus route, model, source with the same
+precedence rule). Rows without an id render without click-to-diff and the
+history pane shows a one-line "text history off (cache.persist=false)" note.
 
 ## Endpoints (all read-only, host-guarded, same router layer)
 
 - `GET /dashboard` — the v2 page (`include_str!`, self-contained).
 - `GET /dashboard/data?range=24h|7d|30d|all` — one JSON payload:
   `totals` (this port, as today), `all_ports` (every `totals_json:*` row +
-  aggregate), `series` (hourly buckets for the range: saved tokens +
+  aggregate; requires a new `meta_scan(prefix) -> Vec<(String, String)>` on
+  the cache — `SELECT k,v FROM meta WHERE k LIKE ?` — since `meta_get` is
+  point-lookup only), `series` (hourly buckets for the range: saved tokens +
   upstream cached per bucket), `breakdown` (source shares llm/cache/rules
-  and per-port saved totals, computed from `savings_hourly`/`requests`),
-  `recent` (latest 50 from `requests` — numbers only, no text).
+  and per-port saved totals, computed from `savings_hourly`/`requests` —
+  labeled in the UI as "last N requests", not lifetime, since the source
+  table is capped), `recent` (latest 50 from `requests` — numbers only, no
+  text). Latest-50-only is the browsable window in v2; the full 5000 rows
+  back the charts and remain available to a future paging param.
 - `GET /dashboard/request/{id}` — `{before_text, after_text, meta…}` for the
   diff pane, fetched lazily on row click.
 - Existing `/health` unchanged.
@@ -80,9 +104,10 @@ section; anti-drift test covers it.
 - Unit: hourly bucket upsert math, requests prune cap, migration v1→v2 on an
   existing DB file (opens, adds tables, preserves rewrites/meta).
 - Integration: /dashboard/data shape incl. range filtering and all_ports;
-  /dashboard/request/{id} returns stored text; pagination cap; host guard on
-  the new endpoints; persist=false → empty history but working page;
-  streaming-fidelity tests untouched.
+  /dashboard/request/{id} returns stored text (incl. the 64 KB truncation
+  flag); recent limit (exactly 50 of >50 stored); host guard on the new
+  endpoints; persist=false → empty history, un-clickable ring rows, working
+  page; streaming-fidelity tests untouched.
 - Live acceptance: real request through the GLM demo appears in history with
   working diff; range switcher renders; both proxies show in "by proxy".
 
