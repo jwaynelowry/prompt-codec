@@ -303,39 +303,6 @@ fn stat_headers(stats: &TokenStats) -> Vec<(HeaderName, HeaderValue)> {
 
 // --- Auth resolution ---------------------------------------------------------
 
-/// The client-supplied request headers `forward` may need to relay upstream:
-/// the two auth shapes plus every `anthropic-*` protocol header. Extracted once
-/// per handler from the incoming request via [`client_headers`].
-#[derive(Default)]
-struct ClientHeaders {
-    authorization: Option<HeaderValue>,
-    x_api_key: Option<HeaderValue>,
-    /// All client request headers whose (lowercase) name starts with
-    /// `anthropic-`, forwarded verbatim upstream. Replaces the single
-    /// `anthropic-version` field: Claude Code sends `anthropic-beta`
-    /// (`oauth-...`, without which the upstream rejects OAuth tokens) and
-    /// `anthropic-dangerous-direct-browser-access` too, and both must survive.
-    /// Auth never lands here — `authorization`/`x-api-key` don't start with
-    /// `anthropic-` — so relaying these can't clobber the resolved auth header.
-    anthropic: Vec<(HeaderName, HeaderValue)>,
-}
-
-/// Pull the auth headers and the full `anthropic-*` set out of an incoming
-/// request's header map. `HeaderName::as_str` is always lowercase (the http
-/// crate normalizes), so the prefix test is inherently case-insensitive.
-fn client_headers(headers: &HeaderMap) -> ClientHeaders {
-    let anthropic = headers
-        .iter()
-        .filter(|(name, _)| name.as_str().starts_with("anthropic-"))
-        .map(|(name, value)| (name.clone(), value.clone()))
-        .collect();
-    ClientHeaders {
-        authorization: headers.get(header::AUTHORIZATION).cloned(),
-        x_api_key: headers.get(X_API_KEY).cloned(),
-        anthropic,
-    }
-}
-
 /// Is this config using the Anthropic-style `x-api-key` upstream auth?
 fn is_x_api_key_style(cfg: &ProxyConfig) -> bool {
     cfg.upstream_auth_style == "x_api_key"
@@ -351,7 +318,11 @@ enum AuthDecision {
     None,
 }
 
-/// Resolve the upstream auth per config and auth style.
+/// Resolve the upstream auth per config and auth style, reading the client's
+/// auth headers directly from the incoming request map. The chosen header is
+/// added to the upstream request exactly ONCE by [`forward`], which withholds
+/// `authorization`/`x-api-key` from its transparent header copy so this decision
+/// is the single source of the auth header (no client/env duplication).
 ///
 /// - `bearer` (default): reject when required-but-absent; else forward the
 ///   client's `Authorization` under `pass_client_auth`; else fall back to the
@@ -363,14 +334,16 @@ fn resolve_auth(
     cfg: &ProxyConfig,
     env_bearer: Option<&HeaderValue>,
     env_x_api_key: Option<&HeaderValue>,
-    client: &ClientHeaders,
+    headers: &HeaderMap,
 ) -> AuthDecision {
+    let client_authorization = headers.get(header::AUTHORIZATION);
+    let client_x_api_key = headers.get(X_API_KEY);
     if is_x_api_key_style(cfg) {
-        if cfg.require_client_auth && client.x_api_key.is_none() && client.authorization.is_none() {
+        if cfg.require_client_auth && client_x_api_key.is_none() && client_authorization.is_none() {
             return AuthDecision::Reject;
         }
         if cfg.pass_client_auth {
-            if let Some(v) = &client.x_api_key {
+            if let Some(v) = client_x_api_key {
                 return AuthDecision::Header(HeaderName::from_static(X_API_KEY), v.clone());
             }
         }
@@ -380,11 +353,11 @@ fn resolve_auth(
         return AuthDecision::None;
     }
 
-    if cfg.require_client_auth && client.authorization.is_none() {
+    if cfg.require_client_auth && client_authorization.is_none() {
         return AuthDecision::Reject;
     }
     if cfg.pass_client_auth {
-        if let Some(v) = &client.authorization {
+        if let Some(v) = client_authorization {
             return AuthDecision::Header(header::AUTHORIZATION, v.clone());
         }
     }
@@ -402,6 +375,29 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
     *name == header::TRANSFER_ENCODING
         || *name == header::CONNECTION
         || *name == header::CONTENT_LENGTH
+}
+
+/// Request headers that must NOT be copied verbatim to the upstream by the
+/// transparent forward: hop-by-hop control fields and framing the HTTP client
+/// recomputes (`Host` from the URL, `Content-Length`/`Transfer-Encoding` from
+/// the rewritten body). Everything else — `User-Agent`, `x-app`, `X-Stainless-*`,
+/// `anthropic-*`, `accept`, ... — is forwarded so OAuth clients that validate
+/// the full request fingerprint (e.g. Claude Code) authenticate upstream. The
+/// auth headers are withheld separately by [`forward`] (re-added once from
+/// [`resolve_auth`]), not here.
+fn is_denied_request_header(name: &HeaderName) -> bool {
+    let n = name.as_str();
+    matches!(
+        n,
+        "host"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "expect"
+            | "upgrade"
+            | "te"
+            | "trailer"
+    ) || n.starts_with("proxy-")
 }
 
 /// Pass-through response-body inspector for the compressing routes: it forwards
@@ -508,11 +504,15 @@ fn stream_response(
     response
 }
 
-/// Send `body` upstream to `url` with the given method, optional content-type,
-/// and resolved auth; stream the reply back. The single forward path used by
-/// the chat, completions, messages, and catch-all routes. `inspect` carries the
-/// totals handle for the compressing routes (tail cached-token capture); the
-/// catch-all passes `None`, so its traffic is never touched.
+/// Send `body` upstream to `url` with the given method, transparently relaying
+/// the client's request headers, and stream the reply back. The single forward
+/// path used by the chat, completions, messages, and catch-all routes.
+/// `req_headers` is the FULL incoming request header map: every header is copied
+/// verbatim except hop-by-hop/recomputed framing ([`is_denied_request_header`])
+/// and the auth headers, which are re-added exactly once from [`resolve_auth`].
+/// `inspect` carries the totals handle for the compressing routes (tail
+/// cached-token capture); the catch-all passes `None`, so its traffic is never
+/// touched.
 // The arg list is the request shape for the ONE shared forward path — keeping
 // them positional (rather than a params struct) preserves the verbatim
 // passthrough design and each call site reads as a plain forward.
@@ -521,17 +521,20 @@ async fn forward(
     state: &AppState,
     method: Method,
     url: String,
-    content_type: Option<HeaderValue>,
-    client: ClientHeaders,
+    req_headers: HeaderMap,
     body: Bytes,
     extra: Vec<(HeaderName, HeaderValue)>,
     inspect: Option<Arc<Totals>>,
 ) -> Response {
+    // Auth is resolved from the client headers and added exactly once below; it
+    // is deliberately EXCLUDED from the transparent copy so the upstream ends up
+    // with a SINGLE auth header — the client's forwarded token under
+    // `pass_client_auth`, otherwise the env fallback (never both).
     let auth = match resolve_auth(
         &state.cfg.proxy,
         state.env_bearer.as_ref(),
         state.env_x_api_key.as_ref(),
-        &client,
+        &req_headers,
     ) {
         AuthDecision::Reject => {
             return error_response(
@@ -545,26 +548,27 @@ async fn forward(
     };
 
     let mut req = state.upstream.request(method, &url);
-    if let Some(ct) = content_type {
-        req = req.header(header::CONTENT_TYPE, ct);
+    // TRANSPARENT header passthrough: copy every client request header except
+    // the denied framing and the auth headers (added once, below). Forwarding
+    // `User-Agent`, `x-app`, `X-Stainless-*`, and `anthropic-*` verbatim is what
+    // lets OAuth clients that validate the full request fingerprint (Claude
+    // Code) authenticate upstream. `Content-Type` rides through as-is.
+    for (name, value) in req_headers.iter() {
+        if is_denied_request_header(name)
+            || name == header::AUTHORIZATION
+            || name.as_str() == X_API_KEY
+        {
+            continue;
+        }
+        req = req.header(name.clone(), value.clone());
     }
     if let Some((name, v)) = auth {
         req = req.header(name, v);
     }
-    // Forward every client `anthropic-*` header verbatim. This carries the
-    // `anthropic-version` and the `anthropic-beta`/`anthropic-dangerous-*` flags
-    // Claude Code depends on (the upstream rejects OAuth tokens without the
-    // `anthropic-beta: oauth-...` flag); harmless on the OpenAI routes.
-    let mut client_sent_version = false;
-    for (name, value) in client.anthropic {
-        if name.as_str() == "anthropic-version" {
-            client_sent_version = true;
-        }
-        req = req.header(name, value);
-    }
     // Anthropic-style (`x-api-key`) upstreams require an `anthropic-version`;
-    // supply the documented default only when the client sent none of its own.
-    if is_x_api_key_style(&state.cfg.proxy) && !client_sent_version {
+    // supply the documented default only when the client sent none of its own
+    // (a client-sent one already flowed through the transparent copy above).
+    if is_x_api_key_style(&state.cfg.proxy) && !req_headers.contains_key("anthropic-version") {
         req = req.header(
             "anthropic-version",
             HeaderValue::from_static(DEFAULT_ANTHROPIC_VERSION),
@@ -693,7 +697,6 @@ async fn compress_messages_in_payload(
 /// `POST /v1/chat/completions`: compress `messages`, forward verbatim.
 async fn chat_completions(State(state): State<Arc<AppState>>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
-    let client = client_headers(&parts.headers);
 
     let bytes = match read_body(body).await {
         Ok(b) => b,
@@ -712,12 +715,12 @@ async fn chat_completions(State(state): State<Arc<AppState>>, request: Request) 
         Ok(b) => b,
         Err(resp) => return resp,
     };
+    let url = upstream_url_with_query(&state, "chat/completions", parts.uri.query());
     forward(
         &state,
         Method::POST,
-        upstream_url_with_query(&state, "chat/completions", parts.uri.query()),
-        Some(HeaderValue::from_static("application/json")),
-        client,
+        url,
+        parts.headers,
         new_body,
         extra,
         Some(state.totals.clone()),
@@ -767,7 +770,6 @@ fn push_recent(state: &AppState, endpoint: &str, stats: &TokenStats, notes: &[St
 /// compression treatment (LLM-eligible per config), then forward verbatim.
 async fn completions(State(state): State<Arc<AppState>>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
-    let client = client_headers(&parts.headers);
 
     let bytes = match read_body(body).await {
         Ok(b) => b,
@@ -803,12 +805,12 @@ async fn completions(State(state): State<Arc<AppState>>, request: Request) -> Re
     // Inspect the response only when we actually compressed (stats produced);
     // an uncompressed passthrough completion is not telemetry-counted.
     let inspect = (!extra.is_empty()).then(|| state.totals.clone());
+    let url = upstream_url_with_query(&state, "completions", parts.uri.query());
     forward(
         &state,
         Method::POST,
-        upstream_url_with_query(&state, "completions", parts.uri.query()),
-        Some(HeaderValue::from_static("application/json")),
-        client,
+        url,
+        parts.headers,
         new_body,
         extra,
         inspect,
@@ -825,7 +827,6 @@ async fn completions(State(state): State<Arc<AppState>>, request: Request) -> Re
 /// field is left alone. Forward verbatim to `{base}/messages`.
 async fn messages(State(state): State<Arc<AppState>>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
-    let client = client_headers(&parts.headers);
 
     let bytes = match read_body(body).await {
         Ok(b) => b,
@@ -843,12 +844,12 @@ async fn messages(State(state): State<Arc<AppState>>, request: Request) -> Respo
         Ok(b) => b,
         Err(resp) => return resp,
     };
+    let url = upstream_url_with_query(&state, "messages", parts.uri.query());
     forward(
         &state,
         Method::POST,
-        upstream_url_with_query(&state, "messages", parts.uri.query()),
-        Some(HeaderValue::from_static("application/json")),
-        client,
+        url,
+        parts.headers,
         new_body,
         extra,
         Some(state.totals.clone()),
@@ -858,14 +859,13 @@ async fn messages(State(state): State<Arc<AppState>>, request: Request) -> Respo
 
 // --- Raw catch-all -----------------------------------------------------------
 
-/// `any /v1/{*path}`: forward the original method, path, query, body bytes,
-/// client content-type, and auth verbatim — NO JSON parsing, no body mutation,
-/// no `x-prompt-codec-*` headers. Covers `/v1/embeddings`, `/v1/models`, etc.
+/// `any /v1/{*path}`: forward the original method, path, query, body bytes, and
+/// all client request headers (auth + content-type + everything else) verbatim
+/// — NO JSON parsing, no body mutation, no `x-prompt-codec-*` headers. Covers
+/// `/v1/embeddings`, `/v1/models`, etc.
 async fn catch_all(State(state): State<Arc<AppState>>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
     let method = parts.method;
-    let content_type = parts.headers.get(header::CONTENT_TYPE).cloned();
-    let client = client_headers(&parts.headers);
 
     let bytes = match read_body(body).await {
         Ok(b) => b,
@@ -883,8 +883,7 @@ async fn catch_all(State(state): State<Arc<AppState>>, request: Request) -> Resp
         &state,
         method,
         url,
-        content_type,
-        client,
+        parts.headers,
         bytes,
         Vec::new(),
         None, // catch-all traffic is never inspected or counted

@@ -1009,10 +1009,11 @@ async fn dashboard_is_host_guarded() {
 #[tokio::test]
 async fn messages_forwards_query_and_anthropic_headers() {
     // Claude Code (ANTHROPIC_BASE_URL=proxy) POSTs `/v1/messages?beta=true` with
-    // a Bearer OAuth token and the full anthropic-* header set. The proxy must
-    // forward the query string AND every anthropic-* header verbatim — without
-    // `anthropic-beta: oauth-...` the upstream rejects the OAuth token — plus
-    // the client's Bearer auth (never overriding it).
+    // a Bearer OAuth token and its full request fingerprint: the anthropic-*
+    // header set, the CLI User-Agent, and X-Stainless-* SDK headers. Anthropic
+    // validates subscription OAuth against that whole fingerprint, so forwarding
+    // must be TRANSPARENT — every client header verbatim (query too), with
+    // exactly ONE auth header (the client's Bearer, never overridden).
     const RESP: &str = r#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"PONG"}]}"#;
 
     let server = MockServer::start().await;
@@ -1040,6 +1041,16 @@ async fn messages_forwards_query_and_anthropic_headers() {
     cfg.proxy.pass_client_auth = true;
     let proxy = spawn_proxy(cfg).await;
 
+    // The client-side (uncompressed) request body — its serialized length is the
+    // baseline the upstream Content-Length must NOT equal (the proxy rewrites the
+    // body, so reqwest recomputes the length downstream).
+    let payload = serde_json::json!({
+        "model": "claude-opus-4",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": FLUFFY}],
+    });
+    let orig_body_len = serde_json::to_vec(&payload).unwrap().len();
+
     let client = Client::new();
     let r = client
         .post(format!("{proxy}/v1/messages?beta=true"))
@@ -1047,11 +1058,10 @@ async fn messages_forwards_query_and_anthropic_headers() {
         .header("anthropic-version", "2023-06-01")
         .header("anthropic-beta", "oauth-2025-04-20,foo")
         .header("anthropic-dangerous-direct-browser-access", "true")
-        .json(&serde_json::json!({
-            "model": "claude-opus-4",
-            "max_tokens": 64,
-            "messages": [{"role": "user", "content": FLUFFY}],
-        }))
+        // Fingerprint headers the OAuth check validates against:
+        .header("user-agent", "claude-cli/2.1.77")
+        .header("x-stainless-lang", "js")
+        .json(&payload)
         .send()
         .await
         .unwrap();
@@ -1074,8 +1084,8 @@ async fn messages_forwards_query_and_anthropic_headers() {
         "query preserved"
     );
 
-    // All three anthropic-* headers arrive byte-identical, plus the Bearer auth
-    // (never overridden by the proxy).
+    // Every fingerprint header arrives byte-identical: anthropic-*, the CLI
+    // User-Agent, and the X-Stainless-* SDK header.
     let hdr = |name: &str| {
         requests[0]
             .headers
@@ -1087,7 +1097,30 @@ async fn messages_forwards_query_and_anthropic_headers() {
     assert_eq!(hdr("anthropic-version"), "2023-06-01");
     assert_eq!(hdr("anthropic-beta"), "oauth-2025-04-20,foo");
     assert_eq!(hdr("anthropic-dangerous-direct-browser-access"), "true");
+    assert_eq!(hdr("user-agent"), "claude-cli/2.1.77");
+    assert_eq!(hdr("x-stainless-lang"), "js");
+
+    // Exactly ONE auth header (the client's Bearer) — no env/client duplication.
     assert_eq!(hdr("authorization"), "Bearer tok123");
+    assert_eq!(
+        requests[0].headers.get_all("authorization").iter().count(),
+        1,
+        "exactly one Authorization header reaches upstream"
+    );
+
+    // Content-Length was recomputed by reqwest for the rewritten (compressed)
+    // body — it is NOT the client's original request length, and it matches the
+    // forwarded body exactly.
+    let up_cl: usize = hdr("content-length").parse().unwrap();
+    assert_eq!(
+        up_cl,
+        requests[0].body.len(),
+        "content-length matches the forwarded (compressed) body"
+    );
+    assert_ne!(
+        up_cl, orig_body_len,
+        "content-length recomputed, not the client's original"
+    );
 }
 
 #[tokio::test]
