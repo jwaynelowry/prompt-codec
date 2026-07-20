@@ -304,21 +304,35 @@ fn stat_headers(stats: &TokenStats) -> Vec<(HeaderName, HeaderValue)> {
 // --- Auth resolution ---------------------------------------------------------
 
 /// The client-supplied request headers `forward` may need to relay upstream:
-/// the two auth shapes plus the Anthropic protocol version. Extracted once per
-/// handler from the incoming request via [`client_headers`].
+/// the two auth shapes plus every `anthropic-*` protocol header. Extracted once
+/// per handler from the incoming request via [`client_headers`].
 #[derive(Default)]
 struct ClientHeaders {
     authorization: Option<HeaderValue>,
     x_api_key: Option<HeaderValue>,
-    anthropic_version: Option<HeaderValue>,
+    /// All client request headers whose (lowercase) name starts with
+    /// `anthropic-`, forwarded verbatim upstream. Replaces the single
+    /// `anthropic-version` field: Claude Code sends `anthropic-beta`
+    /// (`oauth-...`, without which the upstream rejects OAuth tokens) and
+    /// `anthropic-dangerous-direct-browser-access` too, and both must survive.
+    /// Auth never lands here — `authorization`/`x-api-key` don't start with
+    /// `anthropic-` — so relaying these can't clobber the resolved auth header.
+    anthropic: Vec<(HeaderName, HeaderValue)>,
 }
 
-/// Pull the auth/version headers out of an incoming request's header map.
+/// Pull the auth headers and the full `anthropic-*` set out of an incoming
+/// request's header map. `HeaderName::as_str` is always lowercase (the http
+/// crate normalizes), so the prefix test is inherently case-insensitive.
 fn client_headers(headers: &HeaderMap) -> ClientHeaders {
+    let anthropic = headers
+        .iter()
+        .filter(|(name, _)| name.as_str().starts_with("anthropic-"))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
     ClientHeaders {
         authorization: headers.get(header::AUTHORIZATION).cloned(),
         x_api_key: headers.get(X_API_KEY).cloned(),
-        anthropic_version: headers.get("anthropic-version").cloned(),
+        anthropic,
     }
 }
 
@@ -537,13 +551,24 @@ async fn forward(
     if let Some((name, v)) = auth {
         req = req.header(name, v);
     }
-    // Anthropic-style upstreams require an `anthropic-version` header; forward
-    // the client's when present, else the documented default.
-    if is_x_api_key_style(&state.cfg.proxy) {
-        let ver = client
-            .anthropic_version
-            .unwrap_or_else(|| HeaderValue::from_static(DEFAULT_ANTHROPIC_VERSION));
-        req = req.header("anthropic-version", ver);
+    // Forward every client `anthropic-*` header verbatim. This carries the
+    // `anthropic-version` and the `anthropic-beta`/`anthropic-dangerous-*` flags
+    // Claude Code depends on (the upstream rejects OAuth tokens without the
+    // `anthropic-beta: oauth-...` flag); harmless on the OpenAI routes.
+    let mut client_sent_version = false;
+    for (name, value) in client.anthropic {
+        if name.as_str() == "anthropic-version" {
+            client_sent_version = true;
+        }
+        req = req.header(name, value);
+    }
+    // Anthropic-style (`x-api-key`) upstreams require an `anthropic-version`;
+    // supply the documented default only when the client sent none of its own.
+    if is_x_api_key_style(&state.cfg.proxy) && !client_sent_version {
+        req = req.header(
+            "anthropic-version",
+            HeaderValue::from_static(DEFAULT_ANTHROPIC_VERSION),
+        );
     }
     req = req.body(body);
 
@@ -567,6 +592,19 @@ fn upstream_url(state: &AppState, suffix: &str) -> String {
         state.cfg.proxy.upstream_base_url.trim_end_matches('/'),
         suffix.trim_start_matches('/')
     )
+}
+
+/// [`upstream_url`] with the original request query string appended when
+/// present. The compressing routes (chat/completions/messages) must preserve
+/// the client's query (`?beta=true` for Claude Code, `?api-version=...` for
+/// Azure-style clients) exactly as the catch-all already does.
+fn upstream_url_with_query(state: &AppState, suffix: &str, query: Option<&str>) -> String {
+    let mut url = upstream_url(state, suffix);
+    if let Some(q) = query {
+        url.push('?');
+        url.push_str(q);
+    }
+    url
 }
 
 // --- Shared compressing-handler steps -----------------------------------------
@@ -677,7 +715,7 @@ async fn chat_completions(State(state): State<Arc<AppState>>, request: Request) 
     forward(
         &state,
         Method::POST,
-        upstream_url(&state, "chat/completions"),
+        upstream_url_with_query(&state, "chat/completions", parts.uri.query()),
         Some(HeaderValue::from_static("application/json")),
         client,
         new_body,
@@ -768,7 +806,7 @@ async fn completions(State(state): State<Arc<AppState>>, request: Request) -> Re
     forward(
         &state,
         Method::POST,
-        upstream_url(&state, "completions"),
+        upstream_url_with_query(&state, "completions", parts.uri.query()),
         Some(HeaderValue::from_static("application/json")),
         client,
         new_body,
@@ -808,7 +846,7 @@ async fn messages(State(state): State<Arc<AppState>>, request: Request) -> Respo
     forward(
         &state,
         Method::POST,
-        upstream_url(&state, "messages"),
+        upstream_url_with_query(&state, "messages", parts.uri.query()),
         Some(HeaderValue::from_static("application/json")),
         client,
         new_body,
@@ -839,11 +877,7 @@ async fn catch_all(State(state): State<Arc<AppState>>, request: Request) -> Resp
     // routes appending their own suffix to the base).
     let path = parts.uri.path();
     let suffix = path.strip_prefix("/v1").unwrap_or(path);
-    let mut url = upstream_url(&state, suffix);
-    if let Some(q) = parts.uri.query() {
-        url.push('?');
-        url.push_str(q);
-    }
+    let url = upstream_url_with_query(&state, suffix, parts.uri.query());
 
     forward(
         &state,

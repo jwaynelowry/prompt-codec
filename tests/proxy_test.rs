@@ -4,7 +4,7 @@
 
 use prompt_codec::config::AppConfig;
 use reqwest::Client;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Spawn the proxy on an ephemeral loopback port and return its base URL.
@@ -1002,4 +1002,120 @@ async fn dashboard_is_host_guarded() {
         .await
         .unwrap();
     assert_eq!(r.status().as_u16(), 403);
+}
+
+// --- Claude Code passthrough: query strings + anthropic-* headers -----------
+
+#[tokio::test]
+async fn messages_forwards_query_and_anthropic_headers() {
+    // Claude Code (ANTHROPIC_BASE_URL=proxy) POSTs `/v1/messages?beta=true` with
+    // a Bearer OAuth token and the full anthropic-* header set. The proxy must
+    // forward the query string AND every anthropic-* header verbatim — without
+    // `anthropic-beta: oauth-...` the upstream rejects the OAuth token — plus
+    // the client's Bearer auth (never overriding it).
+    const RESP: &str = r#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"PONG"}]}"#;
+
+    let server = MockServer::start().await;
+    // The mock gates on method + path + the query param (a non-match yields 404,
+    // failing the status check below). The header verbatim checks are asserted
+    // in Rust against the received request: wiremock's exact `header` matcher
+    // splits comma-bearing values per HTTP list semantics, so it can't match the
+    // single-value `anthropic-beta: oauth-2025-04-20,foo` string even when the
+    // byte-identical header arrives — an assertion on the raw header is exact.
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(query_param("beta", "true"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_string(RESP),
+        )
+        .mount(&server)
+        .await;
+
+    // bearer style + pass_client_auth: the client's OAuth token passes through;
+    // the proxy holds no key of its own.
+    let mut cfg = rules_cfg(&format!("{}/v1", server.uri()));
+    cfg.proxy.upstream_auth_style = "bearer".into();
+    cfg.proxy.pass_client_auth = true;
+    let proxy = spawn_proxy(cfg).await;
+
+    let client = Client::new();
+    let r = client
+        .post(format!("{proxy}/v1/messages?beta=true"))
+        .header("authorization", "Bearer tok123")
+        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-beta", "oauth-2025-04-20,foo")
+        .header("anthropic-dangerous-direct-browser-access", "true")
+        .json(&serde_json::json!({
+            "model": "claude-opus-4",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": FLUFFY}],
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(r.status().as_u16(), 200);
+    assert!(r.headers().contains_key("x-prompt-codec-before"));
+    assert!(r.headers().contains_key("x-prompt-codec-after"));
+    assert!(r.headers().contains_key("x-prompt-codec-saved-pct"));
+    assert_eq!(
+        r.text().await.unwrap(),
+        RESP,
+        "upstream body byte-identical"
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].url.query(),
+        Some("beta=true"),
+        "query preserved"
+    );
+
+    // All three anthropic-* headers arrive byte-identical, plus the Bearer auth
+    // (never overridden by the proxy).
+    let hdr = |name: &str| {
+        requests[0]
+            .headers
+            .get(name)
+            .unwrap_or_else(|| panic!("upstream missing header {name}"))
+            .to_str()
+            .unwrap()
+    };
+    assert_eq!(hdr("anthropic-version"), "2023-06-01");
+    assert_eq!(hdr("anthropic-beta"), "oauth-2025-04-20,foo");
+    assert_eq!(hdr("anthropic-dangerous-direct-browser-access"), "true");
+    assert_eq!(hdr("authorization"), "Bearer tok123");
+}
+
+#[tokio::test]
+async fn chat_forwards_query_string() {
+    // Azure-style clients carry `api-version` in the query string; the
+    // compressing chat route must preserve it upstream like the catch-all does.
+    const RESP: &str = r#"{"choices":[{"message":{"role":"assistant","content":"done"}}]}"#;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(query_param("api-version", "x"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(RESP))
+        .mount(&server)
+        .await;
+    let proxy = spawn_proxy(rules_cfg(&format!("{}/v1", server.uri()))).await;
+    let client = Client::new();
+    let r = client
+        .post(format!("{proxy}/v1/chat/completions?api-version=x"))
+        .json(&serde_json::json!({"messages": [{"role": "user", "content": FLUFFY}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].url.query(),
+        Some("api-version=x"),
+        "query preserved on the compressing chat route"
+    );
 }

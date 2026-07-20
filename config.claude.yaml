@@ -1,0 +1,32 @@
+# Claude Code passthrough config (v0.3 Feature 4).
+# Route Claude Code through prompt-codec: ANTHROPIC_BASE_URL=http://127.0.0.1:8790 claude
+#
+# The proxy compresses the user text in each request and forwards everything
+# else verbatim to Anthropic — including the client's OAuth token and the
+# anthropic-* protocol headers Claude Code sends (anthropic-version,
+# anthropic-beta, anthropic-dangerous-direct-browser-access).
+#
+# NO secrets live in this file, and the proxy holds NO upstream key of its own:
+# it authenticates purely by passing the caller's own OAuth token through
+# (pass_client_auth), and rejects any unauthenticated request (require_client_auth)
+# so only an authed Claude Code session can ever spend tokens.
+
+proxy:
+  port: 8790
+  # Anthropic's API root. POST /v1/messages lands at {base}/messages.
+  upstream_base_url: "https://api.anthropic.com/v1"
+  # bearer style: the client's `Authorization: Bearer <oauth token>` is relayed
+  # as-is (Claude Code sends an OAuth bearer, not an x-api-key).
+  upstream_auth_style: "bearer"
+  # Intentionally empty: the proxy carries no key of its own. Auth is the
+  # caller's forwarded OAuth token (below) and nothing else.
+  upstream_api_key_env: ""
+  # Forward the client's own Authorization verbatim...
+  pass_client_auth: true
+  # ...and refuse anything unauthenticated (no free upstream spend).
+  require_client_auth: true
+
+encoder:
+  # Rules first, then local-model refine (best savings). The local model is only
+  # used when reachable; otherwise requests degrade to rules-only.
+  mode: hybrid

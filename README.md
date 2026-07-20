@@ -182,6 +182,29 @@ Add to `~/.factory/settings.json` `customModels`:
 }
 ```
 
+### Claude Code
+
+Point the Anthropic CLI at the proxy — it hits `POST /v1/messages` (`?beta=true`),
+which the proxy compresses and forwards to Anthropic:
+
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:8790 claude
+```
+
+`config.claude.yaml` wires this up on port **8790**. It uses `bearer` auth with
+`pass_client_auth: true` and `require_client_auth: true`, so the proxy holds **no
+upstream key of its own** — it relays your Claude Code OAuth token (and the
+`anthropic-version` / `anthropic-beta` / `anthropic-dangerous-direct-browser-access`
+headers the CLI sends) straight through, and rejects any unauthenticated request.
+
+```bash
+./target/release/prompt-codec proxy --config config.claude.yaml
+```
+
+**Caveat:** only **user text** is compressed. Per the fixed v2 role policy, the
+system prompt, assistant turns, and `tool_result` blocks pass through untouched —
+so compression only ever trims what you type, never the model's context or tool output.
+
 ## Modes
 
 | Mode | Needs local LLM? | Behavior |
