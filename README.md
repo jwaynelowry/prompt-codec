@@ -75,8 +75,8 @@ providers:
 ## Local model (stronger savings)
 
 ```bash
-ollama pull qwen3.5:4b-mlx   # A/B-tested default for Hermes traffic
-# edit config.yaml → local.model  (gemma4:12b-mlx = higher fidelity swap)
+ollama pull gemma4:e4b-mlx   # A/B-tested default for Hermes traffic
+# edit config.yaml → local.model  (qwen3.5:4b-mlx = lighter ~4GB fallback)
 prompt-codec health
 prompt-codec encode --mode hybrid "long prompt here..."
 ```
@@ -152,7 +152,7 @@ See `config.yaml` (your live config) / `config.example.yaml` (fully commented re
 |-----|---------|-------|
 | `local.base_url` | `http://127.0.0.1:11434/v1` | OpenAI-compatible local server |
 | `local.api_key` | `ollama` | most local servers ignore this |
-| `local.model` | `qwen3.5:4b-mlx` | must match `ollama list` / your MLX tag |
+| `local.model` | `gemma4:e4b-mlx` | must match `ollama list` / your MLX tag |
 | `local.reasoning_effort` | `none` | stops thinking models burning the output budget; `""` omits the field |
 | `local.temperature` | `0.1` | |
 | `local.max_tokens` | `2048` | ceiling; actual budget is sized per call |
@@ -195,9 +195,9 @@ Python’s extra savings on fenced JSON/code come from corrupting fence interior
 ## A/B: local models (hybrid mode)
 
 Corpus + Hermes-shaped fixtures, hybrid mode, 15s budget, warm model. Latest
-shortlist results live in [`docs/model-ab.md`](docs/model-ab.md). Default remains
-`qwen3.5:4b-mlx` until a challenger beats it on savings, latency, no truncations,
-and the 14-fact fidelity probe.
+shortlist results live in [`docs/model-ab.md`](docs/model-ab.md). Default is
+`gemma4:e4b-mlx` (beats rules on every corpus file, no truncations, 14/14
+fidelity). `qwen3.5:4b-mlx` remains a lighter fallback.
 
 ## Safety / quality
 

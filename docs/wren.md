@@ -24,6 +24,6 @@ Revisit if:
 
 1. Wren exposes a stable OpenAI-compatible `/v1/chat/completions`, or
 2. We want a dedicated MLX backend and can A/B it with `scripts/ab_models.sh`
-   against `qwen3.5:4b-mlx` on `tests/corpus/*` + the 14-fact fidelity probe.
+   against `gemma4:e4b-mlx` on `tests/corpus/*` + the 14-fact fidelity probe.
 
 Until then, keep the Ollama shortlist in [`model-ab.md`](model-ab.md).

@@ -7,8 +7,8 @@ local:
   base_url: "http://127.0.0.1:11434/v1"
   api_key: "ollama"
   # A/B-tested default for Hermes traffic. See docs/model-ab.md for shortlist.
-  # gemma4:12b-mlx (pulled) = max-fidelity one-line swap.
-  model: "qwen3.5:4b-mlx"
+  # qwen3.5:4b-mlx = lighter ~4GB fallback; gemma4:12b-mlx = larger fidelity swap.
+  model: "gemma4:e4b-mlx"
   temperature: 0.1
   max_tokens: 2048
   # Gemma 4 is a thinking model: without this it spends the whole output

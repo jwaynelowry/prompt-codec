@@ -13,7 +13,7 @@ local:
   #   Exo:     http://127.0.0.1:52415/v1
   base_url: "http://127.0.0.1:11434/v1"      # default: http://127.0.0.1:11434/v1
   api_key: "ollama"                          # default: ollama (most local servers ignore this)
-  model: "qwen3.5:4b-mlx"                    # Hermes A/B default (4GB); gemma4:12b-mlx = fidelity swap — match `ollama list`
+  model: "gemma4:e4b-mlx"                    # Hermes A/B default (~8.8GB); qwen3.5:4b-mlx = lighter fallback — match `ollama list`
   temperature: 0.1                           # default: 0.1
   max_tokens: 2048                           # default: 2048 (ceiling; actual budget is sized per call)
   reasoning_effort: "none"                   # default: "none" — stops thinking models (Gemma 4 etc.) burning
