@@ -87,6 +87,9 @@ median_of() {
 
 write_cfg() {
   local model="$1"
+  local cache_dir
+  cache_dir="$(mktemp -d -t prompt-codec-ab-cache.XXXXXX)"
+  # Isolated memory-only cache so prior SQLite hits don't fake latency/savings.
   cat >"$CFG_TMP" <<EOF
 local:
   base_url: "http://127.0.0.1:11434/v1"
@@ -103,6 +106,9 @@ encoder:
   rules_enabled: true
   llm_scope: last_user
   llm_timeout_s: 15
+cache:
+  persist: false
+  path: "$cache_dir/rewrites.sqlite3"
 proxy:
   host: "127.0.0.1"
   port: 8787
@@ -115,12 +121,60 @@ stats:
 EOF
 }
 
+unload_others() {
+  local keep="$1"
+  local name
+  while IFS= read -r name; do
+    [[ -z "$name" || "$name" == "$keep" ]] && continue
+    echo "  unloading $name"
+    curl -sS http://127.0.0.1:11434/api/generate \
+      -d "{\"model\":\"$name\",\"keep_alive\":0}" >/dev/null || true
+  done < <(curl -sS http://127.0.0.1:11434/api/ps 2>/dev/null \
+    | python3 -c 'import sys,json
+try:
+  d=json.load(sys.stdin)
+  for m in d.get("models",[]):
+    print(m.get("name") or m.get("model") or "")
+except Exception:
+  pass')
+}
+
 warm_model() {
   local model="$1"
-  echo "  warming ${model}..."
-  curl -sS http://127.0.0.1:11434/api/generate \
-    -d "{\"model\":\"$model\",\"prompt\":\"hi\",\"stream\":false,\"keep_alive\":\"30m\",\"options\":{\"num_predict\":1}}" \
-    >/dev/null || true
+  local i elapsed
+  echo "  warming ${model} (unload others, keep_alive 60m)..."
+  unload_others "$model"
+  # Cold MLX load can exceed 15s; retry until a short generate finishes quickly.
+  for i in 1 2 3 4 5 6; do
+    elapsed=$(
+      python3 - <<PY
+import json, time, urllib.request
+t0=time.time()
+req=urllib.request.Request(
+  "http://127.0.0.1:11434/api/generate",
+  data=json.dumps({
+    "model": "$model",
+    "prompt": "ping",
+    "stream": False,
+    "keep_alive": "60m",
+    "options": {"num_predict": 4},
+  }).encode(),
+  headers={"Content-Type":"application/json"},
+)
+try:
+  with urllib.request.urlopen(req, timeout=120) as r:
+    r.read()
+  print(round(time.time()-t0, 3))
+except Exception as e:
+  print("fail")
+PY
+    )
+    echo "    warm try$i -> ${elapsed}s"
+    if [[ "$elapsed" != "fail" ]] && python3 -c "import sys; sys.exit(0 if float('$elapsed') < 8 else 1)"; then
+      return 0
+    fi
+  done
+  echo "  warning: model still slow after warm attempts; A/B may hit 15s timeout"
 }
 
 encode_once() {
@@ -172,10 +226,16 @@ if [[ "${FIDELITY_ONLY:-0}" != "1" ]]; then
   echo "| file | model | rules-ish before | after (median) | latency s (median) | notes |" >>"$RESULTS_MD"
   echo "|------|-------|------------------|----------------|--------------------|-------|" >>"$RESULTS_MD"
 
+model_pulled() {
+  local want="$1"
+  curl -sS --max-time 5 http://127.0.0.1:11434/api/tags \
+    | python3 -c 'import sys,json; want=sys.argv[1]; names={m.get("name") for m in json.load(sys.stdin).get("models",[])}; sys.exit(0 if want in names else 1)' "$want"
+}
+
   for model in $MODELS; do
     echo "######## $model ########"
-    if ! ollama show "$model" >/dev/null 2>&1; then
-      echo "  SKIP — not pulled (ollama show failed)"
+    if ! model_pulled "$model"; then
+      echo "  SKIP — not pulled (missing from /api/tags)"
       echo "| *(all)* | \`$model\` | — | SKIP (not pulled) | — | — |" >>"$RESULTS_MD"
       continue
     fi
@@ -211,7 +271,7 @@ echo "|-------|-------|-------|" >>"$RESULTS_MD"
 
 for model in $MODELS; do
   echo "######## fidelity $model ########"
-  if ! ollama show "$model" >/dev/null 2>&1; then
+  if ! model_pulled "$model"; then
     echo "| \`$model\` | SKIP | not pulled |" >>"$RESULTS_MD"
     continue
   fi
