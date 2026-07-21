@@ -1,0 +1,52 @@
+Please continue. Here's what the last terminal tool returned — it's noisy, please
+use only what you need and keep going on the FastAPI auth fix.
+
+Tool result from `terminal` (cwd=/Users/waynelowry/Projects/acme-api):
+
+```
+$ pytest -q tests/test_auth_session.py -vv 2>&1
+============================= test session starts ==============================
+platform darwin -- Python 3.11.9, pytest-8.3.4, pluggy-1.5.0
+rootdir: /Users/waynelowry/Projects/acme-api
+configfile: pyproject.toml
+plugins: anyio-4.8.0, asyncio-0.25.2
+collected 6 items
+
+tests/test_auth_session.py::test_login_issues_refresh PASSED              [ 16%]
+tests/test_auth_session.py::test_refresh_rotates_jti FAILED               [ 33%]
+tests/test_auth_session.py::test_reuse_invalidates_family FAILED          [ 50%]
+tests/test_auth_session.py::test_logout_clears_redis PASSED               [ 66%]
+tests/test_auth_session.py::test_ttl_is_thirty_days PASSED                [ 83%]
+tests/test_auth_session.py::test_public_api_stable PASSED                 [100%]
+
+=================================== FAILURES ===================================
+_________________________ test_refresh_rotates_jti _____________________________
+
+    def test_refresh_rotates_jti(client, redis_client):
+        login = client.post("/auth/login", json={"email": "dev@acme.test", "password": "secret"})
+        old = login.json()["refresh_token"]
+        r1 = client.post("/auth/refresh", json={"refresh_token": old})
+        assert r1.status_code == 200
+        new = r1.json()["refresh_token"]
+>       assert new != old
+E       AssertionError: assert 'eyJhbGciOi...' != 'eyJhbGciOi...'
+E        +  where 'eyJhbGciOi...' = <RefreshToken jti=abc123 family=fam-9f2e>
+
+tests/test_auth_session.py:88: AssertionError
+----------------------------- Captured log call --------------------------------
+WARNING  acme.auth.session:session.py:214 TokenRotationError: expected new jti, got reuse of abc123
+INFO     acme.auth.session:session.py:190 redis setex sess:fam-9f2e ttl=2592000
+=========================== short test summary info ============================
+FAILED tests/test_auth_session.py::test_refresh_rotates_jti
+FAILED tests/test_auth_session.py::test_reuse_invalidates_family
+========================= 2 failed, 4 passed in 1.42s ==========================
+```
+
+Constraints that must survive compression:
+- File under test: `src/auth/session.py` (and only that module for the rotation bug)
+- Exact error: `TokenRotationError: expected new jti, got reuse of abc123`
+- Redis prefix `sess:`, TTL is 30 days (2592000 seconds)
+- Keep public API stable; use existing logging helpers
+- Framework: FastAPI + pytest on Python 3.11
+
+Please fix the two failing tests next, without rewriting the passing ones.

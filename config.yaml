@@ -1,13 +1,13 @@
-# Prompt Codec — local config (v2 / Rust)
-# Local model encodes; paid API only sees compressed prompts.
+# Prompt Codec — Hermes-first densify proxy (v2 / Rust)
+# Point Hermes providers.prompt_codec.api at http://127.0.0.1:8787/v1
+# Local model densifies outbound prompts; paid API only sees the compressed text.
+# Does NOT replace Hermes context compression (compression: / ContextCompressor).
 
 local:
   base_url: "http://127.0.0.1:11434/v1"
   api_key: "ollama"
-  # A/B-tested 2026-07-18 on the golden corpus: qwen3.5:4b-mlx was faster on
-  # every file (1.2-4.2s vs 1.8-5.8s), compressed harder, and handled the
-  # JSON dump gemma4 truncated on. gemma4:12b-mlx (pulled, 7.7GB) is one edit
-  # away if you prefer max fidelity (it kept 14/14 probe facts vs 13/14).
+  # A/B-tested default for Hermes traffic. See docs/model-ab.md for shortlist.
+  # gemma4:12b-mlx (pulled) = max-fidelity one-line swap.
   model: "qwen3.5:4b-mlx"
   temperature: 0.1
   max_tokens: 2048

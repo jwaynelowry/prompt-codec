@@ -1,6 +1,7 @@
-# Prompt Codec — v2 (Rust) config reference.
-# Copy to config.yaml and edit. Every key below is optional; anything you
-# omit falls back to the built-in default shown in its comment. Unknown or
+# Prompt Codec — v2 (Rust) config reference (Hermes-first densify proxy).
+# Copy to config.yaml and edit. Wire Hermes via providers.prompt_codec →
+# http://127.0.0.1:8787/v1 (see README). Every key below is optional; anything
+# you omit falls back to the built-in default shown in its comment. Unknown or
 # v1-only keys are ignored with a `warning:` line on stderr, never a hard
 # error — see the README's config table for the full superseded-key list.
 
@@ -12,7 +13,7 @@ local:
   #   Exo:     http://127.0.0.1:52415/v1
   base_url: "http://127.0.0.1:11434/v1"      # default: http://127.0.0.1:11434/v1
   api_key: "ollama"                          # default: ollama (most local servers ignore this)
-  model: "qwen3.5:4b-mlx"                    # A/B-tested default (4GB); gemma4:12b-mlx (7.7GB) = higher fidelity — match `ollama list`
+  model: "qwen3.5:4b-mlx"                    # Hermes A/B default (4GB); gemma4:12b-mlx = fidelity swap — match `ollama list`
   temperature: 0.1                           # default: 0.1
   max_tokens: 2048                           # default: 2048 (ceiling; actual budget is sized per call)
   reasoning_effort: "none"                   # default: "none" — stops thinking models (Gemma 4 etc.) burning
