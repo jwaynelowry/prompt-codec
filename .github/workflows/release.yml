@@ -1,0 +1,36 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  macos-arm64:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release
+        run: cargo build --release --locked
+      - name: Package
+        run: |
+          stage=prompt-codec-"${GITHUB_REF_NAME}"-macos-arm64
+          mkdir -p "$stage"
+          cp target/release/prompt-codec "$stage/"
+          cp README.md LICENSE config.example.yaml "$stage/"
+          cp contrib/ai.prompt-codec.proxy.plist "$stage/" 2>/dev/null || true
+          tar -czf "${stage}.tar.gz" "$stage"
+          shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
+          ls -lh "${stage}.tar.gz"
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            prompt-codec-*-macos-arm64.tar.gz
+            prompt-codec-*-macos-arm64.tar.gz.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true
