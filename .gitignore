@@ -11,3 +11,7 @@ target/
 /target
 .firecrawl/
 .superpowers/
+
+# Local release packaging artifacts
+prompt-codec-*.tar.gz
+prompt-codec-*.tar.gz.sha256
