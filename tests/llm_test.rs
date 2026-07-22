@@ -221,13 +221,13 @@ async fn health_probe_reports_ok_model_presence_and_down() {
     Mock::given(method("GET"))
         .and(path("/v1/models"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "data": [{"id": "qwen3.5:4b-mlx"}]})))
+            "data": [{"id": "gemma4:e4b-mlx"}]})))
         .mount(&server)
         .await;
     let (c, t) = cfg(&server.uri(), 5.0);
     let h = LlmClient::new(&c, t).health().await;
     assert!(h.ok);
-    assert_eq!(h.model_present, Some(true)); // default model is qwen3.5:4b-mlx
+    assert_eq!(h.model_present, Some(true)); // default model is gemma4:e4b-mlx
     let mut down = LocalConfig::default();
     down.base_url = "http://127.0.0.1:1/v1".into();
     assert!(!LlmClient::new(&down, 5.0).health().await.ok);

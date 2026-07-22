@@ -15,6 +15,9 @@ local:
   # budget on hidden reasoning and every compression fails as truncated.
   # Set to "" if your server (some MLX/Exo builds) rejects the field.
   reasoning_effort: "none"
+  # Keep the encoder model resident (Ollama native pin). "60m" re-pins; "-1"
+  # pins forever; "" disables (cold loads may exceed llm_timeout_s).
+  keep_alive: "60m"
 
 encoder:
   # rules = free, no model | local = LLM rewrite | hybrid = both (recommended)
@@ -33,8 +36,8 @@ encoder:
 proxy:
   host: "127.0.0.1"
   port: 8787
-  # Change to your paid provider OpenAI-compatible base
-  upstream_base_url: "https://api.x.ai/v1"
+  # Hermes OAuth proxy (working credits). Direct api.x.ai + X_API_KEY is over limit.
+  upstream_base_url: "http://127.0.0.1:8317/v1"
   upstream_api_key_env: "X_API_KEY"
   pass_client_auth: true
   log_stats: true

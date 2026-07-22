@@ -2,6 +2,7 @@ pub mod cache;
 pub mod cli;
 pub mod codec;
 pub mod config;
+pub mod doctor;
 pub mod llm;
 pub mod proxy;
 pub mod rules;

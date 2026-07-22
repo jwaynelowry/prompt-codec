@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Keep prompt-codec proxy on :8787 across reboots (needed for Hermes Telegram).
+
+  Install:
+    1. cargo install --path .   # or place the release binary at ~/bin/prompt-codec
+    2. Edit ProgramArguments paths below if your binary/config differ
+    3. cp contrib/ai.prompt-codec.proxy.plist ~/Library/LaunchAgents/
+    4. launchctl load ~/Library/LaunchAgents/ai.prompt-codec.proxy.plist
+
+  Logs: /tmp/prompt-codec-proxy.out.log /tmp/prompt-codec-proxy.err.log
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.prompt-codec.proxy</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/REPLACE_ME/.cargo/bin/prompt-codec</string>
+    <string>proxy</string>
+    <string>--config</string>
+    <string>/Users/REPLACE_ME/.config/prompt-codec/config.yaml</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- Upstream key when not using Hermes OAuth proxy; often unused if upstream is :8317 -->
+    <key>X_API_KEY</key>
+    <string></string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/prompt-codec-proxy.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/prompt-codec-proxy.err.log</string>
+</dict>
+</plist>

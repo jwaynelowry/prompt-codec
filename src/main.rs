@@ -63,6 +63,12 @@ enum Cmd {
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
+    /// Deeper readiness check: local model, keep_alive, upstream, Hermes hints
+    Doctor {
+        /// Path to a config file (default: search chain, then built-in defaults)
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
 }
 
 /// The demo sample prompt, ported verbatim from
@@ -192,6 +198,16 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
+        Cmd::Doctor { config } => {
+            let loaded = resolve_config(config)?;
+            print_config_warnings(&loaded.warnings);
+            let report = prompt_codec::doctor::run_doctor(&loaded.config, &loaded.source).await;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            if !report.ok {
+                std::process::exit(1);
+            }
+        }
+
         Cmd::Proxy { host, port, config } => {
             let loaded = resolve_config(config)?;
             print_config_warnings(&loaded.warnings);
@@ -231,14 +247,27 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
 
-                // Warm-model keep-alive pinner (v0.3): proxy only, local/hybrid
-                // only — pinning a model `rules` mode never calls would waste
-                // RAM. The probe above is done with `llm`, so it moves into the
-                // spawned task; the loop runs concurrently with serving and
-                // must never delay `axum::serve` below.
+                // Warm-model keep-alive: await the first pin so the first
+                // Hermes request does not race a cold MLX/Ollama load and hit
+                // llm_timeout_s. Then re-pin in the background.
                 if !cfg.local.keep_alive.is_empty() {
                     let keep_alive = cfg.local.keep_alive.clone();
                     let interval = repin_interval(&keep_alive);
+                    match llm.pin_model(&keep_alive).await {
+                        Ok(()) => {
+                            println!(
+                                "Local model '{}' pinned (keep_alive={})",
+                                cfg.local.model, keep_alive
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "warning: keep-alive pin failed ({e:#}) — first hybrid \
+                                 request may be slow or fall back to rules; non-Ollama \
+                                 servers (MLX-LM) often ignore native /api/generate"
+                            );
+                        }
+                    }
                     tokio::spawn(keep_alive_loop(llm, keep_alive, interval));
                 }
             }

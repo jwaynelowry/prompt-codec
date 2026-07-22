@@ -18,6 +18,16 @@ Corpus: `fluffy.txt`, `code_heavy.md`, `tool_dump.json`, `hermes_tool_turn.txt` 
 
 Decision rule: fastest model that beats rules on every corpus file, never truncates under budget, and scores 14/14. Only `gemma4:e4b-mlx` clears that bar.
 
+## Fine-tune?
+
+**Defer.** Do not fine-tune or LoRA the encoder yet.
+
+- e4b already scores **14/14** fidelity and beats rules without truncations when warm
+- Failures seen in production are operational (cold load vs `llm_timeout_s`, upstream API-key limits) — fix residency (`keep_alive`), pin-await on proxy start, and upstream routing first
+- Fine-tuning needs a labeled compress corpus, frozen train/eval split, and a recurring fact-drop class that prompt/system-prompt changes cannot stop
+
+Reopen only after ≥100 real Hermes densify turns with logged before/after + planted-fact checks show a systematic miss.
+
 ## Results table
 
 | file | model | before | after (median) | latency s (median) | notes |
